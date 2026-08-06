@@ -1,6 +1,5 @@
 import asyncio
-import os
-import shlex
+import re
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -11,71 +10,34 @@ class GrepError(RuntimeError):
     pass
 
 
-CPU_CORES = os.process_cpu_count() or 1
-RIPGREP_WORKERS = max(CPU_CORES - 1, 1)
+_WORD_CHARACTER = re.compile(r"\w")
 
 
-async def find_nix_files(repository: Path, commit: str) -> bytes:
-    logger.debug("Finding Nix files once at {}", commit)
-    process = await asyncio.create_subprocess_exec(
-        "fd",
-        "-0",
-        "-e",
-        "nix",
-        cwd=repository,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await process.communicate()
-    if process.returncode != 0:
-        message = stderr.decode(errors="replace").strip()
-        raise GrepError(f"failed to find Nix files at commit {commit}: {message}")
-    logger.debug("Cached {} Nix file paths at {}", stdout.count(b"\0"), commit)
-    return stdout
-
-
-async def count_fetcher(
-    repository: Path,
-    commit: str,
+def _matching_prefixes(
     fetcher: str,
-    *,
-    nix_files: bytes | None = None,
-) -> int:
-    if nix_files is None:
-        nix_files = await find_nix_files(repository, commit)
-
-    logger.debug("Counting {} at {}", fetcher, commit)
-    command = f"xargs -0 -r rg -w {shlex.quote(fetcher)} | wc -l"
-    process = await asyncio.create_subprocess_shell(
-        command,
-        cwd=repository,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    fetchers: list[str],
+) -> tuple[str, ...]:
+    return tuple(
+        candidate
+        for candidate in fetchers
+        if fetcher.startswith(candidate)
+        and (
+            len(candidate) == len(fetcher)
+            or _WORD_CHARACTER.fullmatch(fetcher[len(candidate)]) is None
+        )
     )
-    stdout, stderr = await process.communicate(nix_files)
 
-    message = stderr.decode(errors="replace").strip()
-    if process.returncode != 0 or message:
-        logger.debug(
-            "Grep for {} at {} failed with exit code {}: {}",
-            fetcher,
-            commit,
-            process.returncode,
-            message,
-        )
-        raise GrepError(
-            f"failed to count {fetcher!r} at commit {commit}: {message}"
-        )
-    try:
-        count = int(stdout)
-    except ValueError as error:
-        output = stdout.decode(errors="replace").strip()
-        raise GrepError(
-            f"failed to parse count for {fetcher!r} at commit {commit}: {output!r}"
-        ) from error
-    logger.debug("Counted {} matching lines for {} at {}", count, fetcher, commit)
-    return count
+
+def _line_matcher(
+    fetchers: list[str],
+) -> tuple[re.Pattern[str], dict[str, tuple[str, ...]]]:
+    longest_first = sorted(fetchers, key=lambda fetcher: (-len(fetcher), fetcher))
+    alternatives = "|".join(re.escape(fetcher) for fetcher in longest_first)
+    matcher = re.compile(rf"(?=(?<!\w)({alternatives})(?!\w))")
+    prefixes = {
+        fetcher: _matching_prefixes(fetcher, fetchers) for fetcher in fetchers
+    }
+    return matcher, prefixes
 
 
 async def count_fetchers(
@@ -87,28 +49,50 @@ async def count_fetchers(
     if not unique_fetchers:
         logger.debug("No active fetchers to count at {}", commit)
         return {}
-    nix_files = await find_nix_files(repository, commit)
-    semaphore = asyncio.Semaphore(RIPGREP_WORKERS)
+
+    command = [
+        "rg",
+        "--no-filename",
+        "--no-line-number",
+        "--color=never",
+        "--fixed-strings",
+        "--word-regexp",
+    ]
+    for fetcher in unique_fetchers:
+        command.extend(("-e", fetcher))
+    command.extend(("--glob", "*.nix", "."))
+
     logger.debug(
-        "Starting {} ripgrep operations with at most {} workers at {}",
+        "Counting {} fetchers with one ripgrep scan at {}",
         len(unique_fetchers),
-        RIPGREP_WORKERS,
         commit,
     )
-
-    async def worker(fetcher: str) -> int:
-        logger.debug("Waiting for a ripgrep worker for {} at {}", fetcher, commit)
-        async with semaphore:
-            return await count_fetcher(
-                repository,
-                commit,
-                fetcher,
-                nix_files=nix_files,
-            )
-
-    counts = await asyncio.gather(
-        *(worker(fetcher) for fetcher in unique_fetchers)
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=repository,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-    result = dict(zip(unique_fetchers, counts, strict=True))
-    logger.debug("Finished all fetcher counts at {}: {}", commit, result)
-    return result
+    stdout, stderr = await process.communicate()
+    message = stderr.decode(errors="replace").strip()
+    if process.returncode not in {0, 1} or message:
+        logger.debug(
+            "Grep at {} failed with exit code {}: {}",
+            commit,
+            process.returncode,
+            message,
+        )
+        raise GrepError(f"failed to count fetchers at commit {commit}: {message}")
+
+    matcher, prefixes = _line_matcher(unique_fetchers)
+    counts = dict.fromkeys(unique_fetchers, 0)
+    for raw_line in stdout.split(b"\n"):
+        line = raw_line.decode(errors="replace")
+        matching_fetchers: set[str] = set()
+        for match in matcher.finditer(line):
+            matching_fetchers.update(prefixes[match.group(1)])
+        for fetcher in matching_fetchers:
+            counts[fetcher] += 1
+
+    logger.debug("Finished all fetcher counts at {}: {}", commit, counts)
+    return counts

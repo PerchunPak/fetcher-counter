@@ -7,8 +7,7 @@ of Nixpkgs and incrementally store the results in SQLite.
 
 - Python 3.14 and [uv](https://docs.astral.sh/uv/)
 - Git
-- [`fd`](https://github.com/sharkdp/fd),
-  [`ripgrep`](https://github.com/BurntSushi/ripgrep), `xargs`, and `wc`
+- [`ripgrep`](https://github.com/BurntSushi/ripgrep)
 - Nix with `nix-instantiate`
 - A Nixpkgs checkout at `./nixpkgs` (or a path passed with `--nixpkgs`)
 
@@ -59,11 +58,11 @@ represented by an empty active fetcher set. If Nix evaluation fails, the commit
 is persisted with `is_skipped = 1` and no fetcher counts, then processing
 continues with the next sample.
 
-At each checked-out revision, `fd` scans the tree once and its NUL-delimited Nix
-file list is cached in memory. The list is fed to every
-`xargs -0 -r rg -w <fetcher> | wc -l` worker. Ripgrep concurrency is limited to
-one fewer than the available CPU cores, with at least one worker. Each count is
-the number of matching lines across Nix files.
+At each checked-out revision, one ripgrep process scans all Nix files for every
+active fetcher as fixed-string, whole-word patterns. Each matching source line is
+processed once, and each fetcher is counted at most once per line even if it
+appears repeatedly. Each count is therefore the number of matching lines across
+Nix files.
 
 ## Database
 

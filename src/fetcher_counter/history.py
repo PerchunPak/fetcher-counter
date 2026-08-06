@@ -73,23 +73,52 @@ async def sampled_commits(
         raise ValueError("interval must be positive")
 
     tip = await history_tip(repository)
-    output = await _run_git(
-        repository,
+    arguments = (
         "log",
         "--first-parent",
+        "--reverse",
         "--format=%H%x00%cI",
         tip,
     )
-    commits: list[SampledCommit] = []
-    for line in output.decode().splitlines():
-        commit, date = line.split("\0", maxsplit=1)
-        commits.append(SampledCommit(commit=commit, date=date))
-    offset = (len(commits) - 1) % interval
-    samples = commits[offset::interval]
+    logger.debug("Running git in {}: {}", repository, " ".join(arguments))
+    process = await asyncio.create_subprocess_exec(
+        "git",
+        "-C",
+        str(repository),
+        *arguments,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stderr_task = asyncio.create_task(process.stderr.read())
+
+    samples: list[SampledCommit] = []
+    commit_count = 0
+    async for raw_line in process.stdout:
+        if commit_count % interval == 0:
+            commit, date = (
+                raw_line.rstrip(b"\r\n").decode().split("\0", maxsplit=1)
+            )
+            samples.append(SampledCommit(commit=commit, date=date))
+        commit_count += 1
+
+    returncode = await process.wait()
+    stderr = await stderr_task
+    if returncode != 0:
+        message = stderr.decode(errors="replace").strip()
+        logger.debug(
+            "Git command failed with exit code {}: {}",
+            returncode,
+            message,
+        )
+        raise GitCommandError(f"git {' '.join(arguments)} failed: {message}")
+
+    samples.reverse()
     logger.debug(
         "Selected {} of {} commits with oldest-anchored interval {}",
         len(samples),
-        len(commits),
+        commit_count,
         interval,
     )
     logger.debug("Traversing selected commits from newest to oldest")

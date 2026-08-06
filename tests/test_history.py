@@ -5,12 +5,33 @@ from pathlib import Path
 
 import pytest
 
+from fetcher_counter import history
 from fetcher_counter.history import GitCommandError, checkout, sampled_commits
 
 git_path = shutil.which("git")
 if git_path is None:
     raise RuntimeError("git is required for these tests")
 GIT: str = git_path
+
+
+class Process:
+    def __init__(
+        self,
+        returncode: int,
+        *,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+    ) -> None:
+        self.returncode: int = returncode
+        self.stdout: asyncio.StreamReader = asyncio.StreamReader()
+        self.stdout.feed_data(stdout)
+        self.stdout.feed_eof()
+        self.stderr: asyncio.StreamReader = asyncio.StreamReader()
+        self.stderr.feed_data(stderr)
+        self.stderr.feed_eof()
+
+    async def wait(self) -> int:
+        return self.returncode
 
 
 def run_git(repository: Path, *arguments: str) -> str:
@@ -122,3 +143,70 @@ async def test_sampling_keeps_tip_after_historical_checkout(
 async def test_checkout_reports_git_failure(repository: Path) -> None:
     with pytest.raises(GitCommandError, match="checkout"):
         await checkout(repository, "not-a-commit")
+
+
+@pytest.mark.asyncio
+async def test_sampled_commits_streams_oldest_first_log(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    async def fake_tip(_repository: Path) -> str:
+        return "tip"
+
+    async def create_process(
+        *arguments: object,
+        **options: object,
+    ) -> Process:
+        calls.append((arguments, options))
+        return Process(
+            0,
+            stdout=b"oldest\x002001\nsecond\x002002\nthird\x002003\nfourth\x002004\nnewest\x002005\n",
+        )
+
+    monkeypatch.setattr(history, "history_tip", fake_tip)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", create_process)
+
+    samples = await sampled_commits(tmp_path, interval=2)
+
+    assert samples == [
+        history.SampledCommit("newest", "2005"),
+        history.SampledCommit("third", "2003"),
+        history.SampledCommit("oldest", "2001"),
+    ]
+    assert len(calls) == 1
+    arguments, options = calls[0]
+    assert arguments == (
+        "git",
+        "-C",
+        str(tmp_path),
+        "log",
+        "--first-parent",
+        "--reverse",
+        "--format=%H%x00%cI",
+        "tip",
+    )
+    assert options["stdout"] == asyncio.subprocess.PIPE
+    assert options["stderr"] == asyncio.subprocess.PIPE
+
+
+@pytest.mark.asyncio
+async def test_sampled_commits_reports_streamed_log_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def fake_tip(_repository: Path) -> str:
+        return "tip"
+
+    async def create_process(
+        *_arguments: object,
+        **_options: object,
+    ) -> Process:
+        return Process(2, stderr=b"log failed")
+
+    monkeypatch.setattr(history, "history_tip", fake_tip)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", create_process)
+
+    with pytest.raises(GitCommandError, match=r"git log.*log failed"):
+        _ = await sampled_commits(tmp_path, interval=2)

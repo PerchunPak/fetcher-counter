@@ -2,6 +2,8 @@ import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
+from loguru import logger
+
 
 @dataclass(frozen=True, slots=True)
 class SampledCommit:
@@ -17,6 +19,7 @@ HISTORY_REF = "refs/fetcher-counter/history-tip"
 
 
 async def _run_git(repository: Path, *arguments: str) -> bytes:
+    logger.debug("Running git in {}: {}", repository, " ".join(arguments))
     process = await asyncio.create_subprocess_exec(
         "git",
         "-C",
@@ -28,7 +31,13 @@ async def _run_git(repository: Path, *arguments: str) -> bytes:
     stdout, stderr = await process.communicate()
     if process.returncode != 0:
         message = stderr.decode(errors="replace").strip()
+        logger.debug(
+            "Git command failed with exit code {}: {}",
+            process.returncode,
+            message,
+        )
         raise GitCommandError(f"git {' '.join(arguments)} failed: {message}")
+    logger.debug("Git command returned {} bytes", len(stdout))
     return stdout
 
 
@@ -41,13 +50,16 @@ async def history_tip(repository: Path) -> str:
             .strip()
         )
     except GitCommandError:
+        logger.debug("Saving initial history tip {} at {}", head, HISTORY_REF)
         _ = await _run_git(repository, "update-ref", HISTORY_REF, head)
         return head
 
     try:
         _ = await _run_git(repository, "merge-base", "--is-ancestor", saved, head)
     except GitCommandError:
+        logger.debug("Using saved history tip {} instead of HEAD {}", saved, head)
         return saved
+    logger.debug("Advancing saved history tip from {} to {}", saved, head)
     _ = await _run_git(repository, "update-ref", HISTORY_REF, head)
     return head
 
@@ -73,8 +85,16 @@ async def sampled_commits(
     for line in output.decode().splitlines():
         commit, date = line.split("\0", maxsplit=1)
         commits.append(SampledCommit(commit=commit, date=date))
-    return commits[::interval]
+    samples = commits[::interval]
+    logger.debug(
+        "Selected {} of {} first-parent commits with interval {}",
+        len(samples),
+        len(commits),
+        interval,
+    )
+    return samples
 
 
 async def checkout(repository: Path, commit: str) -> None:
+    logger.debug("Checking out Nixpkgs commit {}", commit)
     _ = await _run_git(repository, "checkout", "--detach", "--force", commit)

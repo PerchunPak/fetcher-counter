@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 from typing import cast
 
+from loguru import logger
+
 
 class FetcherDiscoveryError(RuntimeError):
     pass
@@ -14,6 +16,9 @@ async def discover_fetchers(
     *,
     commit: str,
 ) -> list[str]:
+    logger.debug(
+        "Evaluating fetchers at {} with expression {}", commit, expression
+    )
     process = await asyncio.create_subprocess_exec(
         "nix-instantiate",
         "--eval",
@@ -29,6 +34,12 @@ async def discover_fetchers(
     stdout, stderr = await process.communicate()
     if process.returncode != 0:
         message = stderr.decode(errors="replace").strip()
+        logger.debug(
+            "Nix evaluation failed at {} with exit code {}: {}",
+            commit,
+            process.returncode,
+            message,
+        )
         raise FetcherDiscoveryError(
             f"failed to discover fetchers at commit {commit}: {message}"
         )
@@ -48,4 +59,8 @@ async def discover_fetchers(
         raise FetcherDiscoveryError(
             f"Nix returned an invalid fetcher list at commit {commit}"
         )
-    return sorted(set(cast("list[str]", values)))
+    fetchers = sorted(set(cast("list[str]", values)))
+    logger.debug(
+        "Discovered {} fetchers at {}: {}", len(fetchers), commit, fetchers
+    )
+    return fetchers

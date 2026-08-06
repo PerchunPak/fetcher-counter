@@ -2,6 +2,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from loguru import logger
 
 from fetcher_counter import cli
 from fetcher_counter.cli import Config, parse_args, run
@@ -64,13 +65,18 @@ async def test_run_skips_completed_commits_and_persists_active_fetchers(
     monkeypatch.setattr(cli, "discover_fetchers", fake_discovery)
     monkeypatch.setattr(cli, "count_fetchers", fake_counts)
 
-    await run(
-        Config(
-            nixpkgs=tmp_path / "nixpkgs",
-            database=database_path,
-            expression=tmp_path / "get-fetchers.nix",
+    messages: list[str] = []
+    sink_id = logger.add(messages.append, level="DEBUG", format="{message}")
+    try:
+        await run(
+            Config(
+                nixpkgs=tmp_path / "nixpkgs",
+                database=database_path,
+                expression=tmp_path / "get-fetchers.nix",
+            )
         )
-    )
+    finally:
+        logger.remove(sink_id)
 
     connection = sqlite3.connect(database_path)
     rows = connection.execute(
@@ -81,6 +87,15 @@ async def test_run_skips_completed_commits_and_persists_active_fetchers(
     connection.close()
 
     assert checkouts == ["second", "third"]
+    assert any(
+        "Skipping completed commit hashes: ['first']" in line for line in messages
+    )
+    assert any(
+        "Active fetchers at second: ['fetchurl']" in line for line in messages
+    )
+    assert any(
+        "Persisting counts at third: {'fetchzip': 3}" in line for line in messages
+    )
     assert rows == [
         ("first", 1, None, None),
         ("second", None, 2, None),

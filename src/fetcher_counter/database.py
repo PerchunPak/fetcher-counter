@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Self
 
+from loguru import logger
+
 
 def quote_identifier(identifier: str) -> str:
     if "\0" in identifier:
@@ -13,6 +15,7 @@ def quote_identifier(identifier: str) -> str:
 
 class FetcherDatabase:
     def __init__(self, path: Path) -> None:
+        logger.debug("Opening SQLite database at {}", path)
         self._connection: sqlite3.Connection = sqlite3.connect(path)
         self._lock: asyncio.Lock = asyncio.Lock()
 
@@ -25,13 +28,16 @@ class FetcherDatabase:
                 )"""
             )
             self._connection.commit()
+            logger.debug("Initialized fetchers table")
 
     async def completed_commits(self) -> set[str]:
         async with self._lock:
             rows = self._connection.execute(
                 'SELECT "commit" FROM "fetchers"'
             ).fetchall()
-        return {str(row[0]) for row in rows}
+        commits = {str(row[0]) for row in rows}
+        logger.debug("Loaded {} completed commits", len(commits))
+        return commits
 
     async def store(
         self,
@@ -43,6 +49,7 @@ class FetcherDatabase:
             if self._connection.execute(
                 'SELECT 1 FROM "fetchers" WHERE "commit" = ?', (commit,)
             ).fetchone():
+                logger.debug("Commit {} is already stored", commit)
                 return False
 
             existing_columns = {
@@ -51,9 +58,16 @@ class FetcherDatabase:
                     'PRAGMA table_info("fetchers")'
                 )
             }
+            new_fetchers = sorted(counts.keys() - existing_columns)
+            logger.debug(
+                "Storing {} with {} counts; adding columns {}",
+                commit,
+                len(counts),
+                new_fetchers,
+            )
             _ = self._connection.execute("BEGIN")
             try:
-                for fetcher in sorted(counts.keys() - existing_columns):
+                for fetcher in new_fetchers:
                     column = quote_identifier(fetcher)
                     _ = self._connection.execute(
                         f'ALTER TABLE "fetchers" ADD COLUMN {column} INTEGER'
@@ -68,14 +82,17 @@ class FetcherDatabase:
                     values,
                 )
             except BaseException:
+                logger.debug("Rolling back database transaction for {}", commit)
                 self._connection.rollback()
                 raise
             else:
                 self._connection.commit()
+                logger.debug("Committed database row for {}", commit)
             return True
 
     async def close(self) -> None:
         async with self._lock:
+            logger.debug("Closing SQLite database")
             self._connection.close()
 
     async def __aenter__(self) -> Self:

@@ -66,10 +66,12 @@ def parse_args(arguments: list[str] | None = None) -> Config:
 
 
 async def run(config: Config) -> None:
+    logger.debug("Starting fetcher counter with configuration {}", config)
     commits = await sampled_commits(config.nixpkgs, interval=config.interval)
     async with FetcherDatabase(config.database) as database:
         completed = await database.completed_commits()
         pending = [sample for sample in commits if sample.commit not in completed]
+        logger.debug("Skipping completed commit hashes: {}", sorted(completed))
         logger.info(
             "Found {} sampled commits; {} remain",
             len(commits),
@@ -89,11 +91,13 @@ async def run(config: Config) -> None:
                 config.expression,
                 commit=sample.commit,
             )
+            logger.debug("Active fetchers at {}: {}", sample.commit, fetchers)
             counts = await count_fetchers(
                 config.nixpkgs,
                 sample.commit,
                 fetchers,
             )
+            logger.debug("Persisting counts at {}: {}", sample.commit, counts)
             _ = await database.store(sample.commit, sample.date, counts)
 
 

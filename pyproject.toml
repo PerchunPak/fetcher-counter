@@ -16,6 +16,12 @@ dependencies = [
   "loguru~=0.7.3",
 ]
 
+[project.scripts]
+fetcher-counter = "fetcher_counter.cli:main"
+
+[tool.hatch.build.targets.wheel.force-include]
+"get-fetchers.nix" = "fetcher_counter/get-fetchers.nix"
+
 [dependency-groups]
 dev = [
   "typing-extensions~=4.15.0",
@@ -40,6 +46,7 @@ default-groups = ["dev", "tests", "validation"]
 [tool.ruff]
 target-version = "py314"
 line-length = 83
+exclude = ["nixpkgs"]
 
 [tool.ruff.lint]
 select = ["ALL"]

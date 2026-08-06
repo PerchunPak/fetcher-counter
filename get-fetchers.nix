@@ -14,7 +14,7 @@ let
         system = builtins.currentSystem;
       }
     else
-      throw "this Nixpkgs revision has no supported package-set entry point";
+      { };
   packageNames = builtins.attrNames pkgs;
   isFetcher = name: builtins.match "fetch.*" name != null;
 in

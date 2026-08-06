@@ -90,6 +90,19 @@ async def test_checkout_detaches_at_requested_commit(repository: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_sampling_keeps_tip_after_historical_checkout(
+    repository: Path,
+) -> None:
+    hashes = [commit_file(repository, number) for number in range(3)]
+    before = await sampled_commits(repository, interval=1)
+    await checkout(repository, hashes[0])
+
+    after = await sampled_commits(repository, interval=1)
+
+    assert after == before
+
+
+@pytest.mark.asyncio
 async def test_checkout_reports_git_failure(repository: Path) -> None:
     with pytest.raises(GitCommandError, match="checkout"):
         await checkout(repository, "not-a-commit")

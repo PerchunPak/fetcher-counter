@@ -77,7 +77,6 @@ async def sampled_commits(
         repository,
         "log",
         "--first-parent",
-        "--reverse",
         "--format=%H%x00%cI",
         tip,
     )

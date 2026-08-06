@@ -34,10 +34,10 @@ preserve.
 
 ## History and counting semantics
 
-The program obtains `HEAD` history with `--first-parent --reverse` and samples
-commit indices `0, 50, 100, ...`. Anchoring the interval at the oldest commit
-means later Nixpkgs commits append samples without changing previously selected
-ones. The initial history tip is saved as
+The program obtains the saved history tip with `--first-parent` and samples
+commit indices `0, 50, 100, ...` from newest to oldest. This prioritizes recent
+Nixpkgs results; adding new commits can change which older commits fall on the
+50-commit sampling cadence. The initial history tip is saved as
 `refs/fetcher-counter/history-tip` inside the Nixpkgs repository, so a restart
 continues to see the full history even though `HEAD` was left at a historical
 revision. Checking out a newer descendant before another run advances that

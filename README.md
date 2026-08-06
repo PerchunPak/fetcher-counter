@@ -7,6 +7,8 @@ of Nixpkgs and incrementally store the results in SQLite.
 
 - Python 3.14 and [uv](https://docs.astral.sh/uv/)
 - Git
+- [`fd`](https://github.com/sharkdp/fd),
+  [`ripgrep`](https://github.com/BurntSushi/ripgrep), `xargs`, and `wc`
 - Nix with `nix-instantiate`
 - A Nixpkgs checkout at `./nixpkgs` (or a path passed with `--nixpkgs`)
 
@@ -53,9 +55,9 @@ represented by an empty active fetcher set. If Nix evaluation fails, the commit
 is persisted with `is_skipped = 1` and no fetcher counts, then processing
 continues with the next sample.
 
-All active fetchers are counted concurrently with `git grep -F -w -o` over
-`*.nix` files. The `-o` output ensures multiple occurrences on one line are
-counted separately.
+All active fetchers are counted concurrently in the checked-out revision with
+`fd -e nix | xargs rg -w <fetcher> | wc -l`. Each count is the number of matching
+lines across Nix files.
 
 ## Database
 

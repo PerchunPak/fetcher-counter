@@ -12,6 +12,9 @@ git_path = shutil.which("git")
 if git_path is None:
     raise RuntimeError("git is required for these tests")
 GIT: str = git_path
+for command in ("fd", "rg", "wc", "xargs"):
+    if shutil.which(command) is None:
+        raise RuntimeError(f"{command} is required for these tests")
 
 
 @pytest.fixture
@@ -20,7 +23,7 @@ def repository(tmp_path: Path) -> tuple[Path, str]:
         [GIT, "init", "-q", str(tmp_path)], check=True
     )
     _ = (tmp_path / "package.nix").write_text(
-        "fetchurl fetchurl\nfetchFromGitHub\n"
+        "fetchurl\nfetchurl\nfetchFromGitHub\n"
     )
     _ = (tmp_path / "ignored.txt").write_text("fetchurl\n")
     _ = subprocess.run(  # noqa: S603
@@ -49,7 +52,7 @@ def repository(tmp_path: Path) -> tuple[Path, str]:
 
 
 @pytest.mark.asyncio
-async def test_count_fetcher_counts_occurrences_not_lines(
+async def test_count_fetcher_counts_matching_lines(
     repository: tuple[Path, str],
 ) -> None:
     path, commit = repository
@@ -59,9 +62,13 @@ async def test_count_fetcher_counts_occurrences_not_lines(
 
 
 @pytest.mark.asyncio
-async def test_count_fetcher_reports_git_errors(tmp_path: Path) -> None:
-    with pytest.raises(GrepError, match=r"fetchurl.*missing-commit"):
-        _ = await count_fetcher(tmp_path, "missing-commit", "fetchurl")
+async def test_count_fetcher_reports_ripgrep_errors(
+    repository: tuple[Path, str],
+) -> None:
+    path, commit = repository
+
+    with pytest.raises(GrepError, match="unclosed character class"):
+        _ = await count_fetcher(path, commit, "[")
 
 
 @pytest.mark.asyncio

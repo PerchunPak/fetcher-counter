@@ -1,4 +1,5 @@
 import asyncio
+import shlex
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -11,29 +12,16 @@ class GrepError(RuntimeError):
 
 async def count_fetcher(repository: Path, commit: str, fetcher: str) -> int:
     logger.debug("Counting {} at {}", fetcher, commit)
-    process = await asyncio.create_subprocess_exec(
-        "git",
-        "-C",
-        str(repository),
-        "grep",
-        "-F",
-        "-w",
-        "-o",
-        "--no-color",
-        "-e",
-        fetcher,
-        commit,
-        "--",
-        "*.nix",
+    command = f"fd -e nix | xargs rg -w {shlex.quote(fetcher)} | wc -l"
+    process = await asyncio.create_subprocess_shell(
+        command,
+        cwd=repository,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await process.communicate()
-    if process.returncode == 1:
-        logger.debug("Found no occurrences of {} at {}", fetcher, commit)
-        return 0
-    if process.returncode != 0:
-        message = stderr.decode(errors="replace").strip()
+    message = stderr.decode(errors="replace").strip()
+    if process.returncode != 0 or message:
         logger.debug(
             "Grep for {} at {} failed with exit code {}: {}",
             fetcher,
@@ -44,8 +32,14 @@ async def count_fetcher(repository: Path, commit: str, fetcher: str) -> int:
         raise GrepError(
             f"failed to count {fetcher!r} at commit {commit}: {message}"
         )
-    count = len(stdout.splitlines())
-    logger.debug("Counted {} occurrences of {} at {}", count, fetcher, commit)
+    try:
+        count = int(stdout)
+    except ValueError as error:
+        output = stdout.decode(errors="replace").strip()
+        raise GrepError(
+            f"failed to parse count for {fetcher!r} at commit {commit}: {output!r}"
+        ) from error
+    logger.debug("Counted {} matching lines for {} at {}", count, fetcher, commit)
     return count
 
 

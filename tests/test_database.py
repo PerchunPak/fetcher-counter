@@ -3,7 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from fetcher_counter.database import FetcherDatabase, quote_identifier
+from fetcher_counter.database import (
+    FetcherDatabase,
+    quote_identifier,
+    resolve_column_names,
+)
 
 
 @pytest.mark.asyncio
@@ -119,6 +123,58 @@ async def test_store_marks_skipped_rows(tmp_path: Path) -> None:
     connection.close()
 
     assert row == (1,)
+
+
+@pytest.mark.asyncio
+async def test_store_handles_existing_case_insensitive_fetcher_column(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "fetchers.sqlite3"
+    async with FetcherDatabase(path) as database:
+        assert await database.store(
+            "first",
+            "2026-01-01T00:00:00Z",
+            {"fetchFromGitHub": 10},
+        )
+        assert await database.store(
+            "second",
+            "2026-01-02T00:00:00Z",
+            {"fetchFromGitHub": 11, "fetchFromGithub": 1},
+        )
+
+    connection = sqlite3.connect(path)
+    columns = [
+        str(row[1]) for row in connection.execute('PRAGMA table_info("fetchers")')
+    ]
+    rows = connection.execute(
+        """SELECT "fetchFromGitHub", "fetchFromGithub__case_collision_1"
+        FROM "fetchers" ORDER BY "date"
+        """
+    ).fetchall()
+    connection.close()
+
+    assert "fetchFromGitHub" in columns
+    assert "fetchFromGithub__case_collision_1" in columns
+    assert rows == [(10, None), (11, 1)]
+
+
+def test_resolve_column_names_reuses_existing_alias() -> None:
+    existing = {
+        "commit",
+        "date",
+        "is_skipped",
+        "fetchFromGitHub",
+        "fetchFromGithub__case_collision_1",
+    }
+
+    resolved = resolve_column_names(
+        ["fetchFromGitHub", "fetchFromGithub"], existing
+    )
+
+    assert resolved == {
+        "fetchFromGitHub": "fetchFromGitHub",
+        "fetchFromGithub": "fetchFromGithub__case_collision_1",
+    }
 
 
 def test_quote_identifier_escapes_quotes_and_rejects_nul() -> None:

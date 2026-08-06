@@ -69,7 +69,11 @@ with zero for their prior rows. Each dynamically discovered fetcher receives a
 nullable integer column through SQLite's supported `ALTER TABLE ... ADD COLUMN`
 operation. A row only writes columns for fetchers active at that revision, so a
 fetcher that has not appeared yet or has since disappeared is `NULL`, not zero.
-An active fetcher with no textual matches is stored as zero.
+An active fetcher with no textual matches is stored as zero. SQLite column names
+are case-insensitive, while Nix attribute names are not. Case-only collisions
+therefore receive a deterministic `__case_collision_N` suffix; for example,
+`fetchFromGithub` is stored as `fetchFromGithub__case_collision_1` when
+`fetchFromGitHub` already exists.
 
 Schema changes and each commit row are written in one transaction. Existing
 commit hashes are loaded at startup and skipped, making interrupted runs

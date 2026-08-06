@@ -1,6 +1,6 @@
 import asyncio
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Self
 
@@ -11,6 +11,31 @@ def quote_identifier(identifier: str) -> str:
     if "\0" in identifier:
         raise ValueError("SQLite identifiers cannot contain NUL characters")
     return f'"{identifier.replace(chr(34), chr(34) * 2)}"'
+
+
+def resolve_column_names(
+    fetchers: Iterable[str],
+    existing_columns: set[str],
+) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    used = {column.casefold() for column in existing_columns}
+    for fetcher in sorted(set(fetchers)):
+        if fetcher in existing_columns or fetcher.casefold() not in used:
+            column = fetcher
+        else:
+            suffix = 1
+            while True:
+                candidate = f"{fetcher}__case_collision_{suffix}"
+                if (
+                    candidate in existing_columns
+                    or candidate.casefold() not in used
+                ):
+                    column = candidate
+                    break
+                suffix += 1
+        resolved[fetcher] = column
+        used.add(column.casefold())
+    return resolved
 
 
 class FetcherDatabase:
@@ -73,23 +98,38 @@ class FetcherDatabase:
                     'PRAGMA table_info("fetchers")'
                 )
             }
-            new_fetchers = sorted(counts.keys() - existing_columns)
+            column_names = resolve_column_names(counts, existing_columns)
+            new_columns = sorted(set(column_names.values()) - existing_columns)
+            aliases = {
+                fetcher: column
+                for fetcher, column in column_names.items()
+                if fetcher != column
+            }
             logger.debug(
-                "Storing {} with {} counts (is_skipped={}); adding columns {}",
+                "Storing {} with {} counts (is_skipped={})",
                 commit,
                 len(counts),
                 is_skipped,
-                new_fetchers,
+            )
+            logger.debug(
+                "Database columns to add: {}; aliases: {}",
+                new_columns,
+                aliases,
             )
             _ = self._connection.execute("BEGIN")
             try:
-                for fetcher in new_fetchers:
-                    column = quote_identifier(fetcher)
+                for name in new_columns:
+                    column = quote_identifier(name)
                     _ = self._connection.execute(
                         f'ALTER TABLE "fetchers" ADD COLUMN {column} INTEGER'
                     )
 
-                names = ["commit", "date", "is_skipped", *counts]
+                names = [
+                    "commit",
+                    "date",
+                    "is_skipped",
+                    *(column_names[fetcher] for fetcher in counts),
+                ]
                 columns = ", ".join(quote_identifier(name) for name in names)
                 placeholders = ", ".join("?" for _ in names)
                 values: list[str | int] = [

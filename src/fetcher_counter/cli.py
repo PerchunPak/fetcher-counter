@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +12,8 @@ from fetcher_counter.discovery import FetcherDiscoveryError, discover_fetchers
 from fetcher_counter.history import checkout, sampled_commits
 
 DEFAULT_INTERVAL = 50
+DEFAULT_LOG_LEVEL = "INFO"
+LOG_LEVELS = ("TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL")
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +22,7 @@ class Config:
     database: Path
     expression: Path
     interval: int = DEFAULT_INTERVAL
+    log_level: str = DEFAULT_LOG_LEVEL
 
 
 def default_expression() -> Path:
@@ -56,13 +60,26 @@ def parse_args(arguments: list[str] | None = None) -> Config:
         default=DEFAULT_INTERVAL,
         help="first-parent commit sampling interval (default: 50)",
     )
+    _ = parser.add_argument(
+        "--log-level",
+        type=str.upper,
+        choices=LOG_LEVELS,
+        default=DEFAULT_LOG_LEVEL,
+        help="minimum log level (default: INFO)",
+    )
     namespace = parser.parse_args(arguments)
     return Config(
         nixpkgs=namespace.nixpkgs,
         database=namespace.database,
         expression=namespace.expression,
         interval=namespace.interval,
+        log_level=namespace.log_level,
     )
+
+
+def configure_logging(log_level: str) -> None:
+    logger.remove()
+    _ = logger.add(sys.stderr, level=log_level)
 
 
 async def run(config: Config) -> None:
@@ -118,7 +135,9 @@ def main() -> None:
         database=parsed.database.resolve(),
         expression=parsed.expression.resolve(),
         interval=parsed.interval,
+        log_level=parsed.log_level,
     )
+    configure_logging(config.log_level)
     if not config.nixpkgs.is_dir():
         raise SystemExit(f"Nixpkgs checkout does not exist: {config.nixpkgs}")
     if not config.expression.is_file():

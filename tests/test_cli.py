@@ -1,4 +1,5 @@
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,33 @@ def test_parse_args_uses_project_defaults() -> None:
     assert config.nixpkgs == Path("nixpkgs")
     assert config.database == Path("data/fetchers.sqlite3")
     assert config.interval == 50
+    assert config.log_level == "INFO"
+
+
+def test_parse_args_accepts_case_insensitive_log_level() -> None:
+    config = parse_args(["--log-level", "debug"])
+
+    assert config.log_level == "DEBUG"
+
+
+def test_configure_logging_replaces_default_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class FakeLogger:
+        def remove(self) -> None:
+            calls.append(("remove",))
+
+        def add(self, sink: object, *, level: str) -> int:
+            calls.append(("add", sink, level))
+            return 1
+
+    monkeypatch.setattr(cli, "logger", FakeLogger())
+
+    cli.configure_logging("WARNING")
+
+    assert calls == [("remove",), ("add", sys.stderr, "WARNING")]
 
 
 @pytest.mark.asyncio

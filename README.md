@@ -26,8 +26,12 @@ interval can be overridden:
 uv run fetcher-counter \
   --nixpkgs /path/to/nixpkgs \
   --database /path/to/fetchers.sqlite3 \
-  --interval 50
+  --interval 50 \
+  --log-level DEBUG
 ```
+
+`--log-level` accepts `TRACE`, `DEBUG`, `INFO`, `SUCCESS`, `WARNING`, `ERROR`, or
+`CRITICAL` and defaults to `INFO`.
 
 The process checks out historical revisions directly in the supplied Nixpkgs
 checkout. It deliberately does not restore the original revision after success

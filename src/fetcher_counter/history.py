@@ -84,13 +84,15 @@ async def sampled_commits(
     for line in output.decode().splitlines():
         commit, date = line.split("\0", maxsplit=1)
         commits.append(SampledCommit(commit=commit, date=date))
-    samples = commits[::interval]
+    offset = (len(commits) - 1) % interval
+    samples = commits[offset::interval]
     logger.debug(
-        "Selected {} of {} first-parent commits with interval {}",
+        "Selected {} of {} commits with oldest-anchored interval {}",
         len(samples),
         len(commits),
         interval,
     )
+    logger.debug("Traversing selected commits from newest to oldest")
     return samples
 
 

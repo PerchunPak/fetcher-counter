@@ -54,13 +54,29 @@ def repository(tmp_path: Path) -> Path:
 
 
 @pytest.mark.asyncio
-async def test_sampled_commits_are_newest_anchored(repository: Path) -> None:
-    hashes = [commit_file(repository, number) for number in range(5)]
+async def test_samples_are_oldest_anchored_and_traversed_newest_first(
+    repository: Path,
+) -> None:
+    hashes = [commit_file(repository, number) for number in range(6)]
 
     samples = await sampled_commits(repository, interval=2)
 
-    assert [sample.commit for sample in samples] == hashes[::-1][::2]
+    assert [sample.commit for sample in samples] == [
+        hashes[4],
+        hashes[2],
+        hashes[0],
+    ]
     assert all(sample.date for sample in samples)
+
+    newest = commit_file(repository, 6)
+    samples_after_pull = await sampled_commits(repository, interval=2)
+
+    assert [sample.commit for sample in samples_after_pull] == [
+        newest,
+        hashes[4],
+        hashes[2],
+        hashes[0],
+    ]
 
 
 @pytest.mark.asyncio

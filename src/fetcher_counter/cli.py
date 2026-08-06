@@ -7,7 +7,7 @@ from loguru import logger
 
 from fetcher_counter.counting import count_fetchers
 from fetcher_counter.database import FetcherDatabase
-from fetcher_counter.discovery import discover_fetchers
+from fetcher_counter.discovery import FetcherDiscoveryError, discover_fetchers
 from fetcher_counter.history import checkout, sampled_commits
 
 DEFAULT_INTERVAL = 50
@@ -86,11 +86,21 @@ async def run(config: Config) -> None:
                 len(pending),
             )
             await checkout(config.nixpkgs, sample.commit)
-            fetchers = await discover_fetchers(
-                config.nixpkgs,
-                config.expression,
-                commit=sample.commit,
-            )
+            try:
+                fetchers = await discover_fetchers(
+                    config.nixpkgs,
+                    config.expression,
+                    commit=sample.commit,
+                )
+            except FetcherDiscoveryError as error:
+                logger.warning("Skipping {}: {}", sample.commit, error)
+                _ = await database.store(
+                    sample.commit,
+                    sample.date,
+                    {},
+                    is_skipped=True,
+                )
+                continue
             logger.debug("Active fetchers at {}: {}", sample.commit, fetchers)
             counts = await count_fetchers(
                 config.nixpkgs,

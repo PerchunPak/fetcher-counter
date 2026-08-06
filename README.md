@@ -47,8 +47,9 @@ At each sampled revision, `get-fetchers.nix` evaluates the top-level package set
 and selects attribute names matching `fetch.*`. It handles the historical
 `default.nix`, `pkgs/top-level/all-packages.nix`, and
 `pkgs/system/all-packages.nix` entry points. Revisions predating all three are
-represented by an empty active fetcher set. A genuine Nix evaluation failure
-stops the run before that commit is written.
+represented by an empty active fetcher set. If Nix evaluation fails, the commit
+is persisted with `is_skipped = 1` and no fetcher counts, then processing
+continues with the next sample.
 
 All active fetchers are counted concurrently with `git grep -F -w -o` over
 `*.nix` files. The `-o` output ensures multiple occurrences on one line are
@@ -58,11 +59,13 @@ counted separately.
 
 The database contains exactly one table, `fetchers`:
 
-| commit | date | fetchFromGitHub | fetchFromGitLab | ... |
-| --- | --- | ---: | ---: | --- |
-| `553f8e50...` | `2026-01-01T00:00:00+00:00` | 5000 | 3000 | ... |
+| commit | date | is_skipped | fetchFromGitHub | fetchFromGitLab | ... |
+| --- | --- | ---: | ---: | ---: | --- |
+| `553f8e50...` | `2026-01-01T00:00:00+00:00` | 0 | 5000 | 3000 | ... |
 
-`commit` is the primary key. Each dynamically discovered fetcher receives a
+`commit` is the primary key. `is_skipped` is one when fetcher discovery failed
+and zero for successfully counted revisions. Existing databases are migrated
+with zero for their prior rows. Each dynamically discovered fetcher receives a
 nullable integer column through SQLite's supported `ALTER TABLE ... ADD COLUMN`
 operation. A row only writes columns for fetchers active at that revision, so a
 fetcher that has not appeared yet or has since disappeared is `NULL`, not zero.

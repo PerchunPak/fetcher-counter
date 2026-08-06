@@ -24,9 +24,22 @@ class FetcherDatabase:
             _ = self._connection.execute(
                 """CREATE TABLE IF NOT EXISTS "fetchers" (
                     "commit" TEXT PRIMARY KEY,
-                    "date" TEXT NOT NULL
+                    "date" TEXT NOT NULL,
+                    "is_skipped" INTEGER NOT NULL DEFAULT 0
                 )"""
             )
+            columns = {
+                str(row[1])
+                for row in self._connection.execute(
+                    'PRAGMA table_info("fetchers")'
+                )
+            }
+            if "is_skipped" not in columns:
+                logger.debug("Adding is_skipped column to existing database")
+                _ = self._connection.execute(
+                    """ALTER TABLE "fetchers" ADD COLUMN
+                    "is_skipped" INTEGER NOT NULL DEFAULT 0"""
+                )
             self._connection.commit()
             logger.debug("Initialized fetchers table")
 
@@ -44,6 +57,8 @@ class FetcherDatabase:
         commit: str,
         date: str,
         counts: Mapping[str, int],
+        *,
+        is_skipped: bool = False,
     ) -> bool:
         async with self._lock:
             if self._connection.execute(
@@ -60,9 +75,10 @@ class FetcherDatabase:
             }
             new_fetchers = sorted(counts.keys() - existing_columns)
             logger.debug(
-                "Storing {} with {} counts; adding columns {}",
+                "Storing {} with {} counts (is_skipped={}); adding columns {}",
                 commit,
                 len(counts),
+                is_skipped,
                 new_fetchers,
             )
             _ = self._connection.execute("BEGIN")
@@ -73,10 +89,15 @@ class FetcherDatabase:
                         f'ALTER TABLE "fetchers" ADD COLUMN {column} INTEGER'
                     )
 
-                names = ["commit", "date", *counts]
+                names = ["commit", "date", "is_skipped", *counts]
                 columns = ", ".join(quote_identifier(name) for name in names)
                 placeholders = ", ".join("?" for _ in names)
-                values: list[str | int] = [commit, date, *counts.values()]
+                values: list[str | int] = [
+                    commit,
+                    date,
+                    int(is_skipped),
+                    *counts.values(),
+                ]
                 _ = self._connection.execute(
                     f'INSERT INTO "fetchers" ({columns}) VALUES ({placeholders})',  # noqa: S608
                     values,

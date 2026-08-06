@@ -72,22 +72,58 @@ async def test_count_fetcher_reports_ripgrep_errors(
 
 
 @pytest.mark.asyncio
-async def test_count_fetchers_starts_all_counts_concurrently(
+async def test_count_fetchers_caches_files_and_limits_workers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    started: set[str] = set()
-    all_started = asyncio.Event()
+    scans = 0
+    active = 0
+    maximum_active = 0
+    cached_files = b"one.nix\0two.nix\0"
 
-    async def fake_count(_repository: Path, _commit: str, fetcher: str) -> int:
-        started.add(fetcher)
-        if len(started) == 3:
-            _ = all_started.set()
-        _ = await asyncio.wait_for(all_started.wait(), timeout=1)
+    async def fake_find(_repository: Path, _commit: str) -> bytes:
+        nonlocal scans
+        scans += 1
+        return cached_files
+
+    async def fake_count(
+        _repository: Path,
+        _commit: str,
+        fetcher: str,
+        *,
+        nix_files: bytes | None = None,
+    ) -> int:
+        nonlocal active, maximum_active
+        assert nix_files is cached_files
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
         return len(fetcher)
 
+    monkeypatch.setattr(counting, "RIPGREP_WORKERS", 2)
+    monkeypatch.setattr(counting, "find_nix_files", fake_find)
     monkeypatch.setattr(counting, "count_fetcher", fake_count)
 
-    counts = await count_fetchers(tmp_path, "abc", ["three", "one", "two"])
+    counts = await count_fetchers(
+        tmp_path,
+        "abc",
+        ["three", "one", "two", "four"],
+    )
 
-    assert counts == {"one": 3, "three": 5, "two": 3}
+    assert counts == {"four": 4, "one": 3, "three": 5, "two": 3}
+    assert scans == 1
+    assert maximum_active == 2
+
+
+@pytest.mark.asyncio
+async def test_count_fetchers_does_not_scan_without_fetchers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def fail_if_called(_repository: Path, _commit: str) -> bytes:
+        pytest.fail("fd should not run without active fetchers")
+
+    monkeypatch.setattr(counting, "find_nix_files", fail_if_called)
+
+    assert await count_fetchers(tmp_path, "abc", []) == {}

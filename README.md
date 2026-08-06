@@ -55,9 +55,11 @@ represented by an empty active fetcher set. If Nix evaluation fails, the commit
 is persisted with `is_skipped = 1` and no fetcher counts, then processing
 continues with the next sample.
 
-All active fetchers are counted concurrently in the checked-out revision with
-`fd -e nix | xargs rg -w <fetcher> | wc -l`. Each count is the number of matching
-lines across Nix files.
+At each checked-out revision, `fd` scans the tree once and its NUL-delimited Nix
+file list is cached in memory. The list is fed to every
+`xargs -0 -r rg -w <fetcher> | wc -l` worker. Ripgrep concurrency is limited to
+one fewer than the available CPU cores, with at least one worker. Each count is
+the number of matching lines across Nix files.
 
 ## Database
 

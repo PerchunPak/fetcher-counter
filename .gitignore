@@ -1,6 +1,7 @@
 .direnv/
 /data/
 .python-version
+/nixpkgs
 
 # Created by https://www.toptal.com/developers/gitignore/api/linux,python,windows,visualstudiocode
 # Edit at https://www.toptal.com/developers/gitignore?templates=linux,python,windows,visualstudiocode

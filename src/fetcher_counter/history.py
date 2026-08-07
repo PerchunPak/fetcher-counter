@@ -16,6 +16,8 @@ class GitCommandError(RuntimeError):
 
 
 HISTORY_REF = "refs/fetcher-counter/history-tip"
+CHECKOUT_INDEX_LOCK_RETRIES = 3
+CHECKOUT_INDEX_LOCK_RETRY_DELAY = 1.0
 
 
 async def _run_git(repository: Path, *arguments: str) -> bytes:
@@ -125,6 +127,35 @@ async def sampled_commits(
     return samples
 
 
+def _is_index_lock_error(error: GitCommandError) -> bool:
+    message = str(error)
+    return (
+        "fatal: Unable to create '" in message
+        and "index.lock': File exists." in message
+    )
+
+
 async def checkout(repository: Path, commit: str) -> None:
     logger.debug("Checking out Nixpkgs commit {}", commit)
-    _ = await _run_git(repository, "checkout", "--detach", "--force", commit)
+    for retry in range(CHECKOUT_INDEX_LOCK_RETRIES + 1):
+        try:
+            _ = await _run_git(
+                repository,
+                "checkout",
+                "--detach",
+                "--force",
+                commit,
+            )
+        except GitCommandError as error:
+            if retry == CHECKOUT_INDEX_LOCK_RETRIES or not _is_index_lock_error(
+                error
+            ):
+                raise
+            delay = CHECKOUT_INDEX_LOCK_RETRY_DELAY * 2**retry
+            logger.warning(
+                "Git checkout blocked by index lock; retrying in {} seconds",
+                delay,
+            )
+            await asyncio.sleep(delay)
+        else:
+            return

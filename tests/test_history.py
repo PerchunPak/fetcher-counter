@@ -41,6 +41,11 @@ def run_git(repository: Path, *arguments: str) -> str:
     ).strip()
 
 
+def index_lock_error(repository: Path) -> GitCommandError:
+    template = "git checkout failed: fatal: Unable to create '{}': File exists."
+    return GitCommandError(template.format(repository / ".git/index.lock"))
+
+
 def commit_file(repository: Path, number: int) -> str:
     _ = (repository / "value.txt").write_text(str(number))
     _ = subprocess.run(  # noqa: S603
@@ -143,6 +148,77 @@ async def test_sampling_keeps_tip_after_historical_checkout(
 async def test_checkout_reports_git_failure(repository: Path) -> None:
     with pytest.raises(GitCommandError, match="checkout"):
         await checkout(repository, "not-a-commit")
+
+
+@pytest.mark.asyncio
+async def test_checkout_retries_index_lock_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    async def run_git(_repository: Path, *_arguments: str) -> bytes:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise index_lock_error(tmp_path)
+        return b""
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(history, "_run_git", run_git)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+
+    await checkout(tmp_path, "commit")
+
+    assert attempts == 3
+    assert delays == [1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_checkout_stops_retrying_index_lock_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    attempts = 0
+
+    async def run_git(_repository: Path, *_arguments: str) -> bytes:
+        nonlocal attempts
+        attempts += 1
+        raise index_lock_error(tmp_path)
+
+    async def sleep(_delay: float) -> None:
+        return
+
+    monkeypatch.setattr(history, "_run_git", run_git)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+
+    with pytest.raises(GitCommandError, match=r"index\.lock"):
+        await checkout(tmp_path, "commit")
+
+    assert attempts == history.CHECKOUT_INDEX_LOCK_RETRIES + 1
+
+
+@pytest.mark.asyncio
+async def test_checkout_does_not_retry_other_git_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    attempts = 0
+
+    async def run_git(_repository: Path, *_arguments: str) -> bytes:
+        nonlocal attempts
+        attempts += 1
+        raise GitCommandError("git checkout failed: unknown revision")
+
+    monkeypatch.setattr(history, "_run_git", run_git)
+
+    with pytest.raises(GitCommandError, match="unknown revision"):
+        await checkout(tmp_path, "commit")
+
+    assert attempts == 1
 
 
 @pytest.mark.asyncio

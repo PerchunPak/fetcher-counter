@@ -16,6 +16,7 @@ CLI is `fetcher-counter`, implemented in `src/fetcher_counter/`.
   restore its original revision after a run or failure.
 - Never include the resulting `nixpkgs` Gitlink/working-tree modification in an
   implementation commit unless explicitly requested.
+- Prefer to use `pytest -q` instead of `pytest`
 
 ## SQLite invariants
 

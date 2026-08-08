@@ -7,6 +7,7 @@ from loguru import logger
 
 from fetcher_counter import cli
 from fetcher_counter.cli import Config, parse_args, run
+from fetcher_counter.counting import IncrementalCountError
 from fetcher_counter.database import FetcherDatabase
 from fetcher_counter.discovery import FetcherDiscoveryError
 from fetcher_counter.history import SampledCommit
@@ -194,3 +195,225 @@ async def test_run_persists_failed_evaluation_and_continues(
 
     assert counted == ["successful"]
     assert rows == [("failed", 1, None), ("successful", 0, 4)]
+
+
+@pytest.mark.asyncio
+async def test_run_uses_full_baseline_then_adjacent_incremental_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    samples = [
+        SampledCommit("newest", "2026-01-03T00:00:00Z"),
+        SampledCommit("older", "2026-01-02T00:00:00Z"),
+        SampledCommit("oldest", "2026-01-01T00:00:00Z"),
+    ]
+    full_scans: list[str] = []
+    updates: list[tuple[str, str, dict[str, int]]] = []
+
+    async def fake_samples(
+        _repository: Path,
+        *,
+        interval: int,
+    ) -> list[SampledCommit]:
+        assert interval == 50
+        return samples
+
+    async def fake_checkout(_repository: Path, _commit: str) -> None:
+        return None
+
+    async def fake_discovery(
+        _nixpkgs: Path,
+        _expression: Path,
+        *,
+        commit: str,
+    ) -> list[str]:
+        assert commit in {"newest", "older", "oldest"}
+        return ["fetchurl"]
+
+    async def fake_counts(
+        _repository: Path,
+        commit: str,
+        _fetchers: list[str],
+    ) -> dict[str, int]:
+        full_scans.append(commit)
+        return {"fetchurl": 10}
+
+    async def fake_update(
+        _repository: Path,
+        newer_commit: str,
+        older_commit: str,
+        newer_counts: dict[str, int],
+    ) -> dict[str, int]:
+        updates.append((newer_commit, older_commit, newer_counts))
+        return {"fetchurl": newer_counts["fetchurl"] - 1}
+
+    monkeypatch.setattr(cli, "sampled_commits", fake_samples)
+    monkeypatch.setattr(cli, "checkout", fake_checkout)
+    monkeypatch.setattr(cli, "discover_fetchers", fake_discovery)
+    monkeypatch.setattr(cli, "count_fetchers", fake_counts)
+    monkeypatch.setattr(cli, "update_fetcher_counts", fake_update)
+    database_path = tmp_path / "fetchers.sqlite3"
+
+    await run(
+        Config(
+            nixpkgs=tmp_path / "nixpkgs",
+            database=database_path,
+            expression=tmp_path / "get-fetchers.nix",
+        )
+    )
+
+    connection = sqlite3.connect(database_path)
+    rows = connection.execute(
+        'SELECT "commit", "fetchurl" FROM "fetchers" ORDER BY "date" DESC'
+    ).fetchall()
+    connection.close()
+
+    assert full_scans == ["newest"]
+    assert updates == [
+        ("newest", "older", {"fetchurl": 10}),
+        ("older", "oldest", {"fetchurl": 9}),
+    ]
+    assert rows == [("newest", 10), ("older", 9), ("oldest", 8)]
+
+
+@pytest.mark.asyncio
+async def test_run_resumes_from_adjacent_completed_row(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    samples = [
+        SampledCommit("newest", "2026-01-02T00:00:00Z"),
+        SampledCommit("older", "2026-01-01T00:00:00Z"),
+    ]
+    database_path = tmp_path / "fetchers.sqlite3"
+    async with FetcherDatabase(database_path) as database:
+        assert await database.store("newest", samples[0].date, {"fetchurl": 5})
+
+    async def fake_samples(
+        _repository: Path,
+        *,
+        interval: int,
+    ) -> list[SampledCommit]:
+        assert interval == 50
+        return samples
+
+    async def fake_checkout(_repository: Path, _commit: str) -> None:
+        return None
+
+    async def fake_discovery(
+        _nixpkgs: Path,
+        _expression: Path,
+        *,
+        commit: str,
+    ) -> list[str]:
+        assert commit == "older"
+        return ["fetchurl"]
+
+    async def fail_full_scan(
+        _repository: Path,
+        _commit: str,
+        _fetchers: list[str],
+    ) -> dict[str, int]:
+        pytest.fail("an adjacent completed row should avoid a full scan")
+
+    async def fake_update(
+        _repository: Path,
+        newer_commit: str,
+        older_commit: str,
+        newer_counts: dict[str, int],
+    ) -> dict[str, int]:
+        assert (newer_commit, older_commit) == ("newest", "older")
+        assert newer_counts == {"fetchurl": 5}
+        return {"fetchurl": 4}
+
+    monkeypatch.setattr(cli, "sampled_commits", fake_samples)
+    monkeypatch.setattr(cli, "checkout", fake_checkout)
+    monkeypatch.setattr(cli, "discover_fetchers", fake_discovery)
+    monkeypatch.setattr(cli, "count_fetchers", fail_full_scan)
+    monkeypatch.setattr(cli, "update_fetcher_counts", fake_update)
+
+    await run(
+        Config(
+            nixpkgs=tmp_path / "nixpkgs",
+            database=database_path,
+            expression=tmp_path / "get-fetchers.nix",
+        )
+    )
+
+    connection = sqlite3.connect(database_path)
+    row = connection.execute(
+        'SELECT "fetchurl" FROM "fetchers" WHERE "commit" = "older"'
+    ).fetchone()
+    connection.close()
+    assert row == (4,)
+
+
+@pytest.mark.asyncio
+async def test_run_falls_back_when_incremental_count_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    samples = [
+        SampledCommit("newest", "2026-01-02T00:00:00Z"),
+        SampledCommit("older", "2026-01-01T00:00:00Z"),
+    ]
+    database_path = tmp_path / "fetchers.sqlite3"
+    async with FetcherDatabase(database_path) as database:
+        assert await database.store("newest", samples[0].date, {"fetchurl": 5})
+
+    async def fake_samples(
+        _repository: Path,
+        *,
+        interval: int,
+    ) -> list[SampledCommit]:
+        assert interval == 50
+        return samples
+
+    async def fake_checkout(_repository: Path, _commit: str) -> None:
+        return None
+
+    async def fake_discovery(
+        _nixpkgs: Path,
+        _expression: Path,
+        *,
+        commit: str,
+    ) -> list[str]:
+        assert commit == "older"
+        return ["fetchurl"]
+
+    async def fake_update(
+        _repository: Path,
+        _newer_commit: str,
+        _older_commit: str,
+        _newer_counts: dict[str, int],
+    ) -> dict[str, int]:
+        raise IncrementalCountError("bad diff")
+
+    async def fake_counts(
+        _repository: Path,
+        commit: str,
+        _fetchers: list[str],
+    ) -> dict[str, int]:
+        assert commit == "older"
+        return {"fetchurl": 4}
+
+    monkeypatch.setattr(cli, "sampled_commits", fake_samples)
+    monkeypatch.setattr(cli, "checkout", fake_checkout)
+    monkeypatch.setattr(cli, "discover_fetchers", fake_discovery)
+    monkeypatch.setattr(cli, "count_fetchers", fake_counts)
+    monkeypatch.setattr(cli, "update_fetcher_counts", fake_update)
+
+    await run(
+        Config(
+            nixpkgs=tmp_path / "nixpkgs",
+            database=database_path,
+            expression=tmp_path / "get-fetchers.nix",
+        )
+    )
+
+    connection = sqlite3.connect(database_path)
+    row = connection.execute(
+        'SELECT "fetchurl" FROM "fetchers" WHERE "commit" = "older"'
+    ).fetchone()
+    connection.close()
+    assert row == (4,)

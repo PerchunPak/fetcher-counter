@@ -58,11 +58,20 @@ represented by an empty active fetcher set. If Nix evaluation fails, the commit
 is persisted with `is_skipped = 1` and no fetcher counts, then processing
 continues with the next sample.
 
-At each checked-out revision, one ripgrep process scans all Nix files for every
-active fetcher as fixed-string, whole-word patterns. Each matching source line is
-processed once, and each fetcher is counted at most once per line even if it
-appears repeatedly. Each count is therefore the number of matching lines across
-Nix files.
+The first revision without a valid adjacent result uses one ripgrep process to
+scan all Nix files for every active fetcher as fixed-string, whole-word patterns.
+Each matching source line is processed once, and each fetcher is counted at most
+once per line even if it appears repeatedly. Each count is therefore the number
+of matching lines across Nix files.
+
+Because samples are traversed newest to oldest, later revisions normally reuse
+the stored counts from the immediately newer sample. A zero-context Git diff of
+Nix files subtracts matches on lines removed from the newer tree and adds matches
+on lines introduced in the older tree. The program falls back to a full ripgrep
+scan when the adjacent row is missing or skipped, the active fetcher set changed,
+the sample has no newer neighbor, or the diff cannot produce trustworthy
+non-negative counts. This also lets an interrupted run resume incrementally from
+its adjacent completed row.
 
 ## Database
 

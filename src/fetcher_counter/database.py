@@ -77,6 +77,60 @@ class FetcherDatabase:
         logger.debug("Loaded {} completed commits", len(commits))
         return commits
 
+    async def counts_for_commit(
+        self,
+        commit: str,
+        fetchers: Iterable[str],
+    ) -> dict[str, int] | None:
+        async with self._lock:
+            columns = [
+                str(row[1])
+                for row in self._connection.execute(
+                    'PRAGMA table_info("fetchers")'
+                )
+            ]
+            row = self._connection.execute(
+                'SELECT * FROM "fetchers" WHERE "commit" = ?', (commit,)
+            ).fetchone()
+            if row is None:
+                logger.debug("No stored counts are available for {}", commit)
+                return None
+
+            values = dict(zip(columns, row, strict=True))
+            if bool(values["is_skipped"]):
+                logger.debug("Stored commit {} was skipped", commit)
+                return None
+
+            existing_columns = set(columns)
+            column_names = resolve_column_names(fetchers, existing_columns)
+            expected_columns = set(column_names.values())
+            if not expected_columns <= existing_columns:
+                logger.debug(
+                    "Stored commit {} lacks columns for active fetchers",
+                    commit,
+                )
+                return None
+
+            active_columns = {
+                column
+                for column, value in values.items()
+                if column not in {"commit", "date", "is_skipped"}
+                and value is not None
+            }
+            if active_columns != expected_columns:
+                logger.debug(
+                    "Stored commit {} has a different active fetcher set",
+                    commit,
+                )
+                return None
+
+            counts = {
+                fetcher: int(values[column])
+                for fetcher, column in column_names.items()
+            }
+            logger.debug("Loaded {} adjacent counts from {}", len(counts), commit)
+            return counts
+
     async def store(
         self,
         commit: str,

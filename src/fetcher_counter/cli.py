@@ -6,7 +6,11 @@ from pathlib import Path
 
 from loguru import logger
 
-from fetcher_counter.counting import count_fetchers
+from fetcher_counter.counting import (
+    IncrementalCountError,
+    count_fetchers,
+    update_fetcher_counts,
+)
 from fetcher_counter.database import FetcherDatabase
 from fetcher_counter.discovery import FetcherDiscoveryError, discover_fetchers
 from fetcher_counter.history import checkout, sampled_commits
@@ -87,7 +91,11 @@ async def run(config: Config) -> None:
     commits = await sampled_commits(config.nixpkgs, interval=config.interval)
     async with FetcherDatabase(config.database) as database:
         completed = await database.completed_commits()
-        pending = [sample for sample in commits if sample.commit not in completed]
+        pending = [
+            (sample, commits[index - 1] if index else None)
+            for index, sample in enumerate(commits)
+            if sample.commit not in completed
+        ]
         logger.debug("Skipping completed commit hashes: {}", sorted(completed))
         logger.info(
             "Found {} sampled commits; {} remain",
@@ -95,7 +103,7 @@ async def run(config: Config) -> None:
             len(pending),
         )
 
-        for position, sample in enumerate(pending, start=1):
+        for position, (sample, newer_sample) in enumerate(pending, start=1):
             logger.info(
                 "Processing {} ({}/{})",
                 sample.commit,
@@ -119,11 +127,40 @@ async def run(config: Config) -> None:
                 )
                 continue
             logger.debug("Active fetchers at {}: {}", sample.commit, fetchers)
-            counts = await count_fetchers(
-                config.nixpkgs,
-                sample.commit,
-                fetchers,
-            )
+            counts: dict[str, int] | None = None
+            if newer_sample is not None:
+                newer_counts = await database.counts_for_commit(
+                    newer_sample.commit,
+                    fetchers,
+                )
+                if newer_counts is not None:
+                    try:
+                        counts = await update_fetcher_counts(
+                            config.nixpkgs,
+                            newer_sample.commit,
+                            sample.commit,
+                            newer_counts,
+                        )
+                    except IncrementalCountError as error:
+                        logger.warning(
+                            "Incremental count at {} failed; using full scan: {}",
+                            sample.commit,
+                            error,
+                        )
+                    else:
+                        logger.debug(
+                            "Used counts from adjacent commit {} for {}",
+                            newer_sample.commit,
+                            sample.commit,
+                        )
+
+            if counts is None:
+                logger.debug("Using full fetcher scan at {}", sample.commit)
+                counts = await count_fetchers(
+                    config.nixpkgs,
+                    sample.commit,
+                    fetchers,
+                )
             logger.debug("Persisting counts at {}: {}", sample.commit, counts)
             _ = await database.store(sample.commit, sample.date, counts)
 

@@ -181,3 +181,59 @@ def test_quote_identifier_escapes_quotes_and_rejects_nul() -> None:
     assert quote_identifier('fetch"quoted') == '"fetch""quoted"'
     with pytest.raises(ValueError, match="NUL"):
         _ = quote_identifier("fetch\0url")
+
+
+@pytest.mark.asyncio
+async def test_counts_for_commit_requires_exact_active_fetcher_set(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "fetchers.sqlite3"
+    async with FetcherDatabase(path) as database:
+        assert await database.store(
+            "base",
+            "2026-01-01T00:00:00Z",
+            {"fetchurl": 0, "fetchzip": 3},
+        )
+
+        assert await database.counts_for_commit(
+            "base", ["fetchzip", "fetchurl"]
+        ) == {"fetchurl": 0, "fetchzip": 3}
+        assert await database.counts_for_commit("base", ["fetchurl"]) is None
+        assert (
+            await database.counts_for_commit(
+                "base", ["fetchurl", "fetchzip", "newFetcher"]
+            )
+            is None
+        )
+        assert await database.counts_for_commit("missing", ["fetchurl"]) is None
+
+
+@pytest.mark.asyncio
+async def test_counts_for_commit_rejects_skipped_row(tmp_path: Path) -> None:
+    path = tmp_path / "fetchers.sqlite3"
+    async with FetcherDatabase(path) as database:
+        assert await database.store(
+            "skipped",
+            "2026-01-01T00:00:00Z",
+            {},
+            is_skipped=True,
+        )
+
+        assert await database.counts_for_commit("skipped", []) is None
+
+
+@pytest.mark.asyncio
+async def test_counts_for_commit_resolves_case_collision_aliases(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "fetchers.sqlite3"
+    async with FetcherDatabase(path) as database:
+        assert await database.store(
+            "base",
+            "2026-01-01T00:00:00Z",
+            {"fetchFromGitHub": 10, "fetchFromGithub": 1},
+        )
+
+        assert await database.counts_for_commit(
+            "base", ["fetchFromGitHub", "fetchFromGithub"]
+        ) == {"fetchFromGitHub": 10, "fetchFromGithub": 1}

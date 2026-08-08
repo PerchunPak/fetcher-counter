@@ -1,6 +1,6 @@
 import asyncio
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from loguru import logger
@@ -10,7 +10,12 @@ class GrepError(RuntimeError):
     pass
 
 
+class IncrementalCountError(RuntimeError):
+    pass
+
+
 _WORD_CHARACTER = re.compile(r"\w")
+_HUNK_HEADER = re.compile(rb"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 
 
 def _matching_prefixes(
@@ -38,6 +43,18 @@ def _line_matcher(
         fetcher: _matching_prefixes(fetcher, fetchers) for fetcher in fetchers
     }
     return matcher, prefixes
+
+
+def _matching_fetchers(
+    raw_line: bytes,
+    matcher: re.Pattern[str],
+    prefixes: Mapping[str, tuple[str, ...]],
+) -> set[str]:
+    line = raw_line.decode(errors="replace")
+    matching_fetchers: set[str] = set()
+    for match in matcher.finditer(line):
+        matching_fetchers.update(prefixes[match.group(1)])
+    return matching_fetchers
 
 
 async def count_fetchers(
@@ -87,12 +104,121 @@ async def count_fetchers(
     matcher, prefixes = _line_matcher(unique_fetchers)
     counts = dict.fromkeys(unique_fetchers, 0)
     for raw_line in stdout.split(b"\n"):
-        line = raw_line.decode(errors="replace")
-        matching_fetchers: set[str] = set()
-        for match in matcher.finditer(line):
-            matching_fetchers.update(prefixes[match.group(1)])
-        for fetcher in matching_fetchers:
+        for fetcher in _matching_fetchers(raw_line, matcher, prefixes):
             counts[fetcher] += 1
 
     logger.debug("Finished all fetcher counts at {}: {}", commit, counts)
+    return counts
+
+
+def _hunk_length(value: bytes | None) -> int:
+    return 1 if value is None else int(value)
+
+
+def _apply_diff(
+    output: bytes,
+    counts: dict[str, int],
+    matcher: re.Pattern[str],
+    prefixes: Mapping[str, tuple[str, ...]],
+) -> None:
+    old_remaining = 0
+    new_remaining = 0
+
+    for raw_line in output.split(b"\n"):
+        header = _HUNK_HEADER.match(raw_line)
+        if header is not None:
+            if old_remaining or new_remaining:
+                raise IncrementalCountError("incomplete Git diff hunk")
+            old_remaining = _hunk_length(header.group(1))
+            new_remaining = _hunk_length(header.group(2))
+            continue
+
+        if not old_remaining and not new_remaining:
+            continue
+        if not raw_line:
+            break
+
+        marker = raw_line[:1]
+        if marker == b"-" and old_remaining:
+            old_remaining -= 1
+            for fetcher in _matching_fetchers(raw_line[1:], matcher, prefixes):
+                counts[fetcher] -= 1
+        elif marker == b"+" and new_remaining:
+            new_remaining -= 1
+            for fetcher in _matching_fetchers(raw_line[1:], matcher, prefixes):
+                counts[fetcher] += 1
+        elif marker == b" " and old_remaining and new_remaining:
+            old_remaining -= 1
+            new_remaining -= 1
+        elif marker == b"\\":
+            continue
+        else:
+            raise IncrementalCountError("malformed Git diff hunk")
+
+    if old_remaining or new_remaining:
+        raise IncrementalCountError("incomplete Git diff hunk")
+
+
+async def update_fetcher_counts(
+    repository: Path,
+    newer_commit: str,
+    older_commit: str,
+    newer_counts: Mapping[str, int],
+) -> dict[str, int]:
+    counts = dict(sorted(newer_counts.items()))
+    if not counts:
+        return {}
+    if any(count < 0 for count in counts.values()):
+        raise IncrementalCountError("base fetcher count is negative")
+
+    logger.debug(
+        "Updating {} fetcher counts from {} to {} with Git diff",
+        len(counts),
+        newer_commit,
+        older_commit,
+    )
+    command = (
+        "git",
+        "-C",
+        str(repository),
+        "diff",
+        "--unified=0",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-renames",
+        "--text",
+        newer_commit,
+        older_commit,
+        "--",
+        "*.nix",
+    )
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        message = stderr.decode(errors="replace").strip()
+        logger.debug(
+            "Git diff from {} to {} failed with exit code {}: {}",
+            newer_commit,
+            older_commit,
+            process.returncode,
+            message,
+        )
+        detail = f"failed to update counts from {newer_commit} to " + (
+            f"{older_commit}: {message}"
+        )
+        raise IncrementalCountError(detail)
+
+    matcher, prefixes = _line_matcher(list(counts))
+    _apply_diff(stdout, counts, matcher, prefixes)
+    negative = sorted(fetcher for fetcher, count in counts.items() if count < 0)
+    if negative:
+        raise IncrementalCountError(
+            f"incremental counts became negative for {', '.join(negative)}"
+        )
+
+    logger.debug("Finished incremental counts at {}: {}", older_commit, counts)
     return counts

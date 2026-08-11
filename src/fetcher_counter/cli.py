@@ -1,8 +1,11 @@
 import argparse
 import asyncio
 import sys
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 
 from loguru import logger
 
@@ -102,6 +105,20 @@ def configure_logging(log_level: str) -> None:
     _ = logger.add(sys.stderr, level=log_level)
 
 
+@contextmanager
+def timed(stage: str, commit: str) -> Generator[None]:
+    started = perf_counter()
+    try:
+        yield
+    finally:
+        logger.info(
+            "{} at {} took {:.2f} seconds",
+            stage,
+            commit,
+            perf_counter() - started,
+        )
+
+
 async def run(config: Config) -> None:
     if config.full_scan_interval < 1:
         raise ValueError("full scan interval must be positive")
@@ -131,13 +148,15 @@ async def run(config: Config) -> None:
                 position,
                 len(pending),
             )
-            await checkout(config.nixpkgs, sample.commit)
+            with timed("Checkout", sample.commit):
+                await checkout(config.nixpkgs, sample.commit)
             try:
-                fetchers = await discover_fetchers(
-                    config.nixpkgs,
-                    config.expression,
-                    commit=sample.commit,
-                )
+                with timed("Discovery", sample.commit):
+                    fetchers = await discover_fetchers(
+                        config.nixpkgs,
+                        config.expression,
+                        commit=sample.commit,
+                    )
             except FetcherDiscoveryError as error:
                 logger.warning("Skipping {}: {}", sample.commit, error)
                 _ = await database.store(
@@ -165,12 +184,13 @@ async def run(config: Config) -> None:
                 )
                 if newer_counts is not None:
                     try:
-                        counts = await update_fetcher_counts(
-                            config.nixpkgs,
-                            newer_sample.commit,
-                            sample.commit,
-                            newer_counts,
-                        )
+                        with timed("Incremental count", sample.commit):
+                            counts = await update_fetcher_counts(
+                                config.nixpkgs,
+                                newer_sample.commit,
+                                sample.commit,
+                                newer_counts,
+                            )
                     except IncrementalCountError as error:
                         logger.warning(
                             "Incremental count at {} failed; using full scan: {}",
@@ -186,11 +206,12 @@ async def run(config: Config) -> None:
 
             if counts is None:
                 logger.debug("Using full fetcher scan at {}", sample.commit)
-                counts = await count_fetchers(
-                    config.nixpkgs,
-                    sample.commit,
-                    fetchers,
-                )
+                with timed("Full scan", sample.commit):
+                    counts = await count_fetchers(
+                        config.nixpkgs,
+                        sample.commit,
+                        fetchers,
+                    )
             logger.debug("Persisting counts at {}: {}", sample.commit, counts)
             _ = await database.store(sample.commit, sample.date, counts)
 

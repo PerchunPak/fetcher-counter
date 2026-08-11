@@ -17,6 +17,8 @@ CLI is `fetcher-counter`, implemented in `src/fetcher_counter/`.
 - Never include the resulting `nixpkgs` Gitlink/working-tree modification in an
   implementation commit unless explicitly requested.
 - Prefer to use `pytest -q` instead of `pytest`
+- After you've made your changes, make a commit. This will also run all
+  required verification checks. Do not run `git push` or open a PR.
 
 ## SQLite invariants
 

@@ -16,6 +16,7 @@ from fetcher_counter.discovery import FetcherDiscoveryError, discover_fetchers
 from fetcher_counter.history import checkout, sampled_commits
 
 DEFAULT_INTERVAL = 50
+DEFAULT_FULL_SCAN_INTERVAL = 25
 DEFAULT_LOG_LEVEL = "INFO"
 LOG_LEVELS = ("TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL")
 
@@ -26,6 +27,7 @@ class Config:
     database: Path
     expression: Path
     interval: int = DEFAULT_INTERVAL
+    full_scan_interval: int = DEFAULT_FULL_SCAN_INTERVAL
     log_level: str = DEFAULT_LOG_LEVEL
 
 
@@ -34,6 +36,13 @@ def default_expression() -> Path:
     if packaged.is_file():
         return packaged
     return Path(__file__).resolve().parents[2] / "get-fetchers.nix"
+
+
+def _positive_int(value: str) -> int:
+    integer = int(value)
+    if integer < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return integer
 
 
 def parse_args(arguments: list[str] | None = None) -> Config:
@@ -65,6 +74,12 @@ def parse_args(arguments: list[str] | None = None) -> Config:
         help="first-parent commit sampling interval (default: 50)",
     )
     _ = parser.add_argument(
+        "--full-scan-interval",
+        type=_positive_int,
+        default=DEFAULT_FULL_SCAN_INTERVAL,
+        help="sampled iterations between full scans (default: 25)",
+    )
+    _ = parser.add_argument(
         "--log-level",
         type=str.upper,
         choices=LOG_LEVELS,
@@ -77,6 +92,7 @@ def parse_args(arguments: list[str] | None = None) -> Config:
         database=namespace.database,
         expression=namespace.expression,
         interval=namespace.interval,
+        full_scan_interval=namespace.full_scan_interval,
         log_level=namespace.log_level,
     )
 
@@ -87,12 +103,14 @@ def configure_logging(log_level: str) -> None:
 
 
 async def run(config: Config) -> None:
+    if config.full_scan_interval < 1:
+        raise ValueError("full scan interval must be positive")
     logger.debug("Starting fetcher counter with configuration {}", config)
     commits = await sampled_commits(config.nixpkgs, interval=config.interval)
     async with FetcherDatabase(config.database) as database:
         completed = await database.completed_commits()
         pending = [
-            (sample, commits[index - 1] if index else None)
+            (index, sample, commits[index - 1] if index else None)
             for index, sample in enumerate(commits)
             if sample.commit not in completed
         ]
@@ -103,7 +121,10 @@ async def run(config: Config) -> None:
             len(pending),
         )
 
-        for position, (sample, newer_sample) in enumerate(pending, start=1):
+        for position, (sample_index, sample, newer_sample) in enumerate(
+            pending,
+            start=1,
+        ):
             logger.info(
                 "Processing {} ({}/{})",
                 sample.commit,
@@ -128,7 +149,16 @@ async def run(config: Config) -> None:
                 continue
             logger.debug("Active fetchers at {}: {}", sample.commit, fetchers)
             counts: dict[str, int] | None = None
-            if newer_sample is not None:
+            scheduled_full_scan = (
+                sample_index + 1
+            ) % config.full_scan_interval == 0
+            if scheduled_full_scan:
+                logger.debug(
+                    "Using scheduled full scan at {} (sample iteration {})",
+                    sample.commit,
+                    sample_index + 1,
+                )
+            if newer_sample is not None and not scheduled_full_scan:
                 newer_counts = await database.counts_for_commit(
                     newer_sample.commit,
                     fetchers,
@@ -172,6 +202,7 @@ def main() -> None:
         database=parsed.database.resolve(),
         expression=parsed.expression.resolve(),
         interval=parsed.interval,
+        full_scan_interval=parsed.full_scan_interval,
         log_level=parsed.log_level,
     )
     configure_logging(config.log_level)

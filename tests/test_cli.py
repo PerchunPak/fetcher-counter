@@ -19,13 +19,38 @@ def test_parse_args_uses_project_defaults() -> None:
     assert config.nixpkgs == Path("nixpkgs")
     assert config.database == Path("data/fetchers.sqlite3")
     assert config.interval == 50
+    assert config.full_scan_interval == 25
     assert config.log_level == "INFO"
+
+
+def test_parse_args_accepts_full_scan_interval() -> None:
+    config = parse_args(["--full-scan-interval", "7"])
+
+    assert config.full_scan_interval == 7
+
+
+def test_parse_args_rejects_nonpositive_full_scan_interval() -> None:
+    with pytest.raises(SystemExit):
+        _ = parse_args(["--full-scan-interval", "0"])
 
 
 def test_parse_args_accepts_case_insensitive_log_level() -> None:
     config = parse_args(["--log-level", "debug"])
 
     assert config.log_level == "DEBUG"
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_nonpositive_full_scan_interval(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="full scan interval must be positive"):
+        await run(
+            Config(
+                nixpkgs=tmp_path / "nixpkgs",
+                database=tmp_path / "fetchers.sqlite3",
+                expression=tmp_path / "get-fetchers.nix",
+                full_scan_interval=0,
+            )
+        )
 
 
 def test_configure_logging_replaces_default_sink(
@@ -274,6 +299,148 @@ async def test_run_uses_full_baseline_then_adjacent_incremental_counts(
         ("older", "oldest", {"fetchurl": 9}),
     ]
     assert rows == [("newest", 10), ("older", 9), ("oldest", 8)]
+
+
+@pytest.mark.asyncio
+async def test_run_forces_full_scan_at_configured_interval(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    samples = [
+        SampledCommit(f"commit-{position}", f"2026-01-{position:02d}T00:00:00Z")
+        for position in range(1, 7)
+    ]
+    full_scans: list[str] = []
+    updates: list[tuple[str, str]] = []
+
+    async def fake_samples(
+        _repository: Path,
+        *,
+        interval: int,
+    ) -> list[SampledCommit]:
+        assert interval == 50
+        return samples
+
+    async def fake_checkout(_repository: Path, _commit: str) -> None:
+        return None
+
+    async def fake_discovery(
+        _nixpkgs: Path,
+        _expression: Path,
+        *,
+        commit: str,
+    ) -> list[str]:
+        assert commit.startswith("commit-")
+        return ["fetchurl"]
+
+    async def fake_counts(
+        _repository: Path,
+        commit: str,
+        _fetchers: list[str],
+    ) -> dict[str, int]:
+        full_scans.append(commit)
+        return {"fetchurl": 10}
+
+    async def fake_update(
+        _repository: Path,
+        newer_commit: str,
+        older_commit: str,
+        newer_counts: dict[str, int],
+    ) -> dict[str, int]:
+        updates.append((newer_commit, older_commit))
+        return newer_counts
+
+    monkeypatch.setattr(cli, "sampled_commits", fake_samples)
+    monkeypatch.setattr(cli, "checkout", fake_checkout)
+    monkeypatch.setattr(cli, "discover_fetchers", fake_discovery)
+    monkeypatch.setattr(cli, "count_fetchers", fake_counts)
+    monkeypatch.setattr(cli, "update_fetcher_counts", fake_update)
+
+    await run(
+        Config(
+            nixpkgs=tmp_path / "nixpkgs",
+            database=tmp_path / "fetchers.sqlite3",
+            expression=tmp_path / "get-fetchers.nix",
+            full_scan_interval=5,
+        )
+    )
+
+    assert full_scans == ["commit-1", "commit-5"]
+    assert ("commit-3", "commit-4") in updates
+    assert ("commit-4", "commit-5") not in updates
+    assert ("commit-5", "commit-6") in updates
+    assert len(updates) == 4
+
+
+@pytest.mark.asyncio
+async def test_run_uses_history_position_for_scheduled_full_scan_after_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    samples = [
+        SampledCommit(f"commit-{position}", f"2026-01-{position:02d}T00:00:00Z")
+        for position in range(1, 26)
+    ]
+    database_path = tmp_path / "fetchers.sqlite3"
+    async with FetcherDatabase(database_path) as database:
+        for sample in samples[:-1]:
+            assert await database.store(
+                sample.commit, sample.date, {"fetchurl": 10}
+            )
+
+    full_scans: list[str] = []
+
+    async def fake_samples(
+        _repository: Path,
+        *,
+        interval: int,
+    ) -> list[SampledCommit]:
+        assert interval == 50
+        return samples
+
+    async def fake_checkout(_repository: Path, commit: str) -> None:
+        assert commit == "commit-25"
+
+    async def fake_discovery(
+        _nixpkgs: Path,
+        _expression: Path,
+        *,
+        commit: str,
+    ) -> list[str]:
+        assert commit == "commit-25"
+        return ["fetchurl"]
+
+    async def fake_counts(
+        _repository: Path,
+        commit: str,
+        _fetchers: list[str],
+    ) -> dict[str, int]:
+        full_scans.append(commit)
+        return {"fetchurl": 9}
+
+    async def fail_update(
+        _repository: Path,
+        _newer_commit: str,
+        _older_commit: str,
+        _newer_counts: dict[str, int],
+    ) -> dict[str, int]:
+        pytest.fail("the scheduled full scan should not use incremental counts")
+
+    monkeypatch.setattr(cli, "sampled_commits", fake_samples)
+    monkeypatch.setattr(cli, "checkout", fake_checkout)
+    monkeypatch.setattr(cli, "discover_fetchers", fake_discovery)
+    monkeypatch.setattr(cli, "count_fetchers", fake_counts)
+    monkeypatch.setattr(cli, "update_fetcher_counts", fail_update)
+
+    await run(
+        Config(
+            nixpkgs=tmp_path / "nixpkgs",
+            database=database_path,
+            expression=tmp_path / "get-fetchers.nix",
+        )
+    )
+
+    assert full_scans == ["commit-25"]
 
 
 @pytest.mark.asyncio

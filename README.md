@@ -18,14 +18,15 @@ uv sync
 uv run fetcher-counter
 ```
 
-The default database is `./data/fetchers.sqlite3`. Paths and the sampling
-interval can be overridden:
+The default database is `./data/fetchers.sqlite3`. Paths, the commit sampling
+interval, and the full-scan interval can be overridden:
 
 ```console
 uv run fetcher-counter \
   --nixpkgs /path/to/nixpkgs \
   --database /path/to/fetchers.sqlite3 \
   --interval 50 \
+  --full-scan-interval 25 \
   --log-level DEBUG
 ```
 
@@ -67,11 +68,14 @@ of matching lines across Nix files.
 Because samples are traversed newest to oldest, later revisions normally reuse
 the stored counts from the immediately newer sample. A zero-context Git diff of
 Nix files subtracts matches on lines removed from the newer tree and adds matches
-on lines introduced in the older tree. The program falls back to a full ripgrep
-scan when the adjacent row is missing or skipped, the active fetcher set changed,
-the sample has no newer neighbor, or the diff cannot produce trustworthy
-non-negative counts. This also lets an interrupted run resume incrementally from
-its adjacent completed row.
+on lines introduced in the older tree. By default, every 25th sampled iteration
+forces a full ripgrep scan as a periodic correctness checkpoint; this cadence can
+be changed with `--full-scan-interval`. The program also falls back to a full
+scan when the adjacent row is missing or skipped, the active fetcher set
+changed, the sample has no newer neighbor, or the diff cannot produce
+trustworthy non-negative counts. This lets an interrupted run resume
+incrementally from its adjacent completed row while keeping the safety checkpoints
+anchored to stable positions in the sampled history.
 
 ## Database
 

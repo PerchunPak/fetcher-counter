@@ -18,6 +18,19 @@ class GitCommandError(RuntimeError):
 HISTORY_REF = "refs/fetcher-counter/history-tip"
 CHECKOUT_INDEX_LOCK_RETRIES = 3
 CHECKOUT_INDEX_LOCK_RETRY_DELAY = 1.0
+# Historical checkouts of Nixpkgs are dominated by index work rather than by
+# writing the few files that differ: the index holds tens of thousands of
+# entries and is rewritten on every checkout. Version 4 compresses path names,
+# skipping the trailing hash avoids checksumming the whole index, and parallel
+# workers speed up the revisions that do rewrite many files.
+CHECKOUT_OPTIONS = (
+    "-c",
+    "index.version=4",
+    "-c",
+    "index.skipHash=true",
+    "-c",
+    "checkout.workers=0",
+)
 
 
 async def _run_git(repository: Path, *arguments: str) -> bytes:
@@ -141,9 +154,12 @@ async def checkout(repository: Path, commit: str) -> None:
         try:
             _ = await _run_git(
                 repository,
+                *CHECKOUT_OPTIONS,
                 "checkout",
                 "--detach",
                 "--force",
+                "--quiet",
+                "--no-recurse-submodules",
                 commit,
             )
         except GitCommandError as error:

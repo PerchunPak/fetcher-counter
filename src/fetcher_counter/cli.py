@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter
+from typing import override
 
 from loguru import logger
 from rich.console import Console
@@ -14,6 +15,7 @@ from rich.progress import (
     MofNCompleteColumn,
     Progress,
     ProgressColumn,
+    Task,
     TaskID,
     TimeElapsedColumn,
     TimeRemainingColumn,
@@ -181,11 +183,29 @@ def parse_args(arguments: list[str] | None = None) -> Config:
     )
 
 
+class CommitRateColumn(ProgressColumn):
+    @override
+    def render(self, task: Task) -> Text:
+        speed = task.finished_speed if task.finished else task.speed
+        if speed is None:
+            return Text("-- commits/min", style="progress.data.speed")
+        if speed >= 1:
+            return Text(
+                f"{speed:.2f} commits/s",
+                style="progress.data.speed",
+            )
+        return Text(
+            f"{speed * 60:.2f} commits/min",
+            style="progress.data.speed",
+        )
+
+
 def progress_columns() -> tuple[str | ProgressColumn, ...]:
     return (
         "[progress.description]{task.description}",
         MofNCompleteColumn(),
         BarColumn(),
+        CommitRateColumn(),
         "[",
         TimeElapsedColumn(),
         TimeRemainingColumn(),
@@ -197,7 +217,7 @@ def configure_logging(log_level: str) -> None:
     logger.remove()
     _ = logger.configure(extra={"shard": COORDINATOR_SHARD})
     _ = logger.add(
-        lambda message: console.print(Text.from_ansi(message), end=""),
+        lambda message: console.print(Text.from_ansi(message)),
         level=log_level,
         format=LOG_FORMAT,
         colorize=console.is_terminal,

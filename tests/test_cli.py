@@ -7,6 +7,7 @@ from typing import ClassVar, Self
 
 import pytest
 from loguru import logger
+from rich.progress import ProgressSample, Task, TaskID
 from rich.text import Text
 
 from fetcher_counter import cli
@@ -73,7 +74,7 @@ def test_configure_logging_replaces_default_sink(
     class FakeConsole:
         is_terminal: bool = True
 
-        def print(self, message: Text, *, end: str) -> None:
+        def print(self, message: Text, *, end: str = "\n") -> None:
             printed.append((message, end))
 
     class FakeLogger:
@@ -106,7 +107,51 @@ def test_configure_logging_replaces_default_sink(
         ("add", "WARNING", cli.LOG_FORMAT, True),
     ]
     assert printed[0][0].plain == "warning"
-    assert printed[0][1] == ""
+    assert printed[0][1] == "\n"
+
+
+def progress_task(*, speed: float | None, finished: bool = False) -> Task:
+    task = Task(
+        id=TaskID(0),
+        description="Total",
+        total=10,
+        completed=2,
+        _get_time=lambda: 1.0,
+    )
+    if finished:
+        task.finished_time = 1.0
+        task.finished_speed = speed
+    elif speed is not None:
+        task.start_time = 0.0
+        task._progress.append(ProgressSample(0.0, 0.0))
+        task._progress.append(ProgressSample(1.0, speed))
+    return task
+
+
+def test_commit_rate_column_shows_placeholder_without_speed() -> None:
+    rendered = cli.CommitRateColumn().render(progress_task(speed=None))
+
+    assert rendered.plain == "-- commits/min"
+
+
+def test_commit_rate_column_shows_commits_per_second() -> None:
+    rendered = cli.CommitRateColumn().render(progress_task(speed=2.5))
+
+    assert rendered.plain == "2.50 commits/s"
+
+
+def test_commit_rate_column_shows_commits_per_minute() -> None:
+    rendered = cli.CommitRateColumn().render(progress_task(speed=0.25))
+
+    assert rendered.plain == "15.00 commits/min"
+
+
+def test_commit_rate_column_keeps_finished_speed() -> None:
+    rendered = cli.CommitRateColumn().render(
+        progress_task(speed=1.5, finished=True)
+    )
+
+    assert rendered.plain == "1.50 commits/s"
 
 
 def test_progress_columns_match_nupd_layout() -> None:
@@ -115,10 +160,11 @@ def test_progress_columns_match_nupd_layout() -> None:
     assert columns[0] == "[progress.description]{task.description}"
     assert type(columns[1]).__name__ == "MofNCompleteColumn"
     assert type(columns[2]).__name__ == "BarColumn"
-    assert columns[3] == "["
-    assert type(columns[4]).__name__ == "TimeElapsedColumn"
-    assert type(columns[5]).__name__ == "TimeRemainingColumn"
-    assert columns[6] == "]"
+    assert type(columns[3]).__name__ == "CommitRateColumn"
+    assert columns[4] == "["
+    assert type(columns[5]).__name__ == "TimeElapsedColumn"
+    assert type(columns[6]).__name__ == "TimeRemainingColumn"
+    assert columns[7] == "]"
 
 
 def test_log_format_labels_coordinator_and_shard_messages() -> None:

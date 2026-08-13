@@ -153,7 +153,9 @@ reportMissingParameterType = false # ruff's flake8-annotations (ANN) already cov
 reportImportCycles = false # tests catch that
 
 executionEnvironments = [
-  { root = "tests", reportPrivateUsage = false },
+  # `extraPaths` lets the shared fixtures in `tests/conftest.py` be imported
+  # as `tests.conftest`, which is how pytest imports the test package too.
+  { root = "tests", extraPaths = ["."], reportPrivateUsage = false },
 ]
 
 [tool.pytest]

@@ -1,6 +1,8 @@
 import asyncio
 import contextlib
-from dataclasses import dataclass
+import fcntl
+from collections.abc import Generator, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from loguru import logger
@@ -14,11 +16,33 @@ class SampledCommit:
     date: str
 
 
+@dataclass(frozen=True, slots=True)
+class WorktreeRequest:
+    index: int
+    initial_commit: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorktreeRecord:
+    path: Path
+    attributes: dict[str, str] = field(default_factory=dict[str, str])
+
+
 class GitCommandError(RuntimeError):
     pass
 
 
+class WorktreeError(RuntimeError):
+    pass
+
+
+class WorktreePoolLockedError(RuntimeError):
+    pass
+
+
 HISTORY_REF = "refs/fetcher-counter/history-tip"
+POOL_LOCK_NAME = "coordinator.lock"
+STATUS_DETAIL_LINES = 5
 CHECKOUT_INDEX_LOCK_RETRIES = 3
 CHECKOUT_INDEX_LOCK_RETRY_DELAY = 1.0
 # Historical checkouts of Nixpkgs are dominated by index work rather than by
@@ -239,3 +263,195 @@ async def checkout(repository: Path, commit: str) -> None:
             await asyncio.sleep(delay)
         else:
             return
+
+
+def _canonical(path: Path) -> Path:
+    """Canonicalize a path that may not exist yet.
+
+    A registered but missing worktree still has to compare against the
+    listing, so resolution must not require the path to exist.
+    """
+    return path.resolve(strict=False)
+
+
+def worker_name(index: int) -> str:
+    return f"worker-{index}"
+
+
+@contextlib.contextmanager
+def worktree_pool_lock(pool_dir: Path) -> Generator[None]:
+    """Own the managed worker worktree pool at `pool_dir` for this run.
+
+    The pool directory and its lock file are created here, because the lock
+    has to be held before anything else touches shared state. Contention
+    fails immediately instead of blocking the event loop, and the lock file
+    is deliberately left on disk: the advisory lock, not the file, marks
+    ownership, so a crashed run releases it by closing its descriptor.
+    """
+    if pool_dir.exists() and not pool_dir.is_dir():
+        raise WorktreeError(f"worktree pool path is not a directory: {pool_dir}")
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = pool_dir / POOL_LOCK_NAME
+    if lock_path.is_dir():
+        raise WorktreeError(f"worktree pool lock path is a directory: {lock_path}")
+    logger.debug("Locking worktree pool {}", pool_dir)
+    lock_file = lock_path.open("a+b")
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise WorktreePoolLockedError(
+                f"another fetcher-counter invocation is using {pool_dir}"
+            ) from error
+        yield
+    finally:
+        lock_file.close()
+        logger.debug("Released worktree pool lock for {}", pool_dir)
+
+
+def parse_worktree_list(output: bytes) -> list[WorktreeRecord]:
+    """Parse `git worktree list --porcelain -z` into records.
+
+    Attributes are NUL terminated and records are separated by an empty
+    entry, so paths containing whitespace survive. Attributes beyond
+    `worktree` (`bare`, `detached`, `branch`, `locked`, `prunable`) may
+    appear in any order and may carry no value.
+    """
+    records: list[WorktreeRecord] = []
+    attributes: dict[str, str] = {}
+
+    def flush() -> None:
+        nonlocal attributes
+        if not attributes:
+            return
+        path = attributes.get("worktree")
+        if path is None:
+            raise WorktreeError(
+                "git worktree list returned a record without a path"
+            )
+        records.append(WorktreeRecord(path=Path(path), attributes=attributes))
+        attributes = {}
+
+    for raw_entry in output.split(b"\0"):
+        entry = raw_entry.decode(errors="replace")
+        if not entry:
+            flush()
+            continue
+        key, _, value = entry.partition(" ")
+        attributes[key] = value
+    flush()
+    return records
+
+
+async def _worktree_records(repository: Path) -> dict[Path, WorktreeRecord]:
+    listing = await _run_git(repository, "worktree", "list", "--porcelain", "-z")
+    return {
+        _canonical(record.path): record for record in parse_worktree_list(listing)
+    }
+
+
+def _validate_registered_worktree(record: WorktreeRecord, path: Path) -> None:
+    if "locked" in record.attributes:
+        reason = record.attributes["locked"] or "no reason given"
+        raise WorktreeError(
+            f"worker worktree {path} is locked ({reason}); fetcher-counter"
+            + " refuses to reuse locked worktrees even though Git could"
+        )
+    if "prunable" in record.attributes:
+        reason = record.attributes["prunable"] or "no reason given"
+        raise WorktreeError(
+            f"worker worktree {path} is prunable ({reason}); fetcher-counter"
+            + " refuses to reuse prunable worktrees even though Git could"
+        )
+    if not path.is_dir():
+        raise WorktreeError(
+            f"worker worktree {path} is registered but missing; run"
+            + " 'git worktree prune' and try again"
+        )
+
+
+async def _require_pristine_worktree(path: Path) -> None:
+    """Refuse a worker worktree holding any state at all.
+
+    Ignored files matter as much as untracked ones: a later historical
+    checkout can un-ignore a stray `.nix` file, which `count_fetchers()`
+    would then count, and any stray file can obstruct that checkout.
+    """
+    status = await _run_git(
+        path,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignored=matching",
+    )
+    if not status:
+        return
+    detail = status.decode(errors="replace").strip().splitlines()
+    raise WorktreeError(
+        f"worker worktree {path} is not pristine: "
+        + f"{'; '.join(detail[:STATUS_DETAIL_LINES])}. Inspect and clean it"
+        + " manually; fetcher-counter never resets a worktree"
+    )
+
+
+async def _create_worktree(repository: Path, path: Path, commit: str) -> None:
+    logger.info("Creating worker worktree {} at {}", path, commit)
+    _ = await _run_git(
+        repository,
+        *CHECKOUT_OPTIONS,
+        "worktree",
+        "add",
+        "--detach",
+        str(path),
+        commit,
+    )
+
+
+async def provision_worktrees(
+    *,
+    repository: Path,
+    pool_dir: Path,
+    requests: Sequence[WorktreeRequest],
+) -> dict[int, Path]:
+    """Create or safely reuse one persistent worktree per request.
+
+    `pool_dir` is expected to exist already, because `worktree_pool_lock()`
+    creates it. Nothing is ever cleaned, reset, or removed here: every
+    unexpected state is reported instead, and worktrees created before a
+    later failure stay registered for reuse.
+    """
+    records = await _worktree_records(repository)
+    source = _canonical(repository)
+    assigned: dict[Path, int] = {}
+    worktrees: dict[int, Path] = {}
+
+    for request in requests:
+        path = pool_dir / worker_name(request.index)
+        target = _canonical(path)
+        if target == source:
+            raise WorktreeError(
+                f"worker worktree {path} is the supplied Nixpkgs checkout"
+            )
+        if target in assigned:
+            raise WorktreeError(
+                f"worker worktree {path} is already assigned to shard"
+                + f" {assigned[target]}"
+            )
+        record = records.get(target)
+        if record is None:
+            if path.exists():
+                raise WorktreeError(
+                    f"{path} exists but is not a worktree of {repository};"
+                    + " it belongs to another repository or is not a worktree"
+                    + " at all, so fetcher-counter leaves it untouched"
+                )
+            await _create_worktree(repository, path, request.initial_commit)
+            records[target] = WorktreeRecord(path=path)
+        else:
+            _validate_registered_worktree(record, path)
+            await _require_pristine_worktree(path)
+            logger.debug("Reusing pristine worker worktree {}", path)
+        assigned[target] = request.index
+        worktrees[request.index] = path
+
+    return worktrees

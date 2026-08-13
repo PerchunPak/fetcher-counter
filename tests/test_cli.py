@@ -1,5 +1,7 @@
+import asyncio
 import sqlite3
 import sys
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -10,7 +12,12 @@ from fetcher_counter.cli import Config, parse_args, run
 from fetcher_counter.counting import IncrementalCountError
 from fetcher_counter.database import FetcherDatabase
 from fetcher_counter.discovery import FetcherDiscoveryError
-from fetcher_counter.history import SampledCommit
+from fetcher_counter.history import (
+    SampledCommit,
+    WorktreePoolLockedError,
+    WorktreeRequest,
+    worktree_pool_lock,
+)
 
 
 def test_parse_args_uses_project_defaults() -> None:
@@ -21,6 +28,8 @@ def test_parse_args_uses_project_defaults() -> None:
     assert config.interval == 50
     assert config.full_scan_interval == 25
     assert config.log_level == "INFO"
+    assert config.workers == 1
+    assert config.worktrees_dir is None
 
 
 def test_parse_args_accepts_full_scan_interval() -> None:
@@ -62,15 +71,42 @@ def test_configure_logging_replaces_default_sink(
         def remove(self) -> None:
             calls.append(("remove",))
 
-        def add(self, sink: object, *, level: str) -> int:
-            calls.append(("add", sink, level))
+        def configure(self, *, extra: dict[str, str]) -> None:
+            calls.append(("configure", extra))
+
+        def add(self, sink: object, *, level: str, format: str) -> int:
+            calls.append(("add", sink, level, format))
             return 1
 
     monkeypatch.setattr(cli, "logger", FakeLogger())
 
     cli.configure_logging("WARNING")
 
-    assert calls == [("remove",), ("add", sys.stderr, "WARNING")]
+    assert calls == [
+        ("remove",),
+        ("configure", {"shard": "main"}),
+        ("add", sys.stderr, "WARNING", cli.LOG_FORMAT),
+    ]
+
+
+def test_log_format_labels_coordinator_and_shard_messages() -> None:
+    messages: list[str] = []
+    _ = logger.configure(extra={"shard": cli.COORDINATOR_SHARD})
+    sink_id = logger.add(
+        messages.append,
+        level="INFO",
+        format=cli.LOG_FORMAT,
+        colorize=False,
+    )
+    try:
+        logger.info("coordinator message")
+        with logger.contextualize(shard="shard 3"):
+            logger.info("shard message")
+    finally:
+        logger.remove(sink_id)
+
+    assert "[main] coordinator message" in messages[0]
+    assert "[shard 3] shard message" in messages[1]
 
 
 @pytest.mark.asyncio
@@ -584,3 +620,622 @@ async def test_run_falls_back_when_incremental_count_fails(
     ).fetchone()
     connection.close()
     assert row == (4,)
+
+
+def samples_named(*names: str) -> list[SampledCommit]:
+    return [
+        SampledCommit(name, f"2026-01-{position:02d}T00:00:00Z")
+        for position, name in enumerate(names, start=1)
+    ]
+
+
+def indexed(samples: list[SampledCommit]) -> list[tuple[int, SampledCommit]]:
+    return list(enumerate(samples))
+
+
+class Environment:
+    """The expensive stages of a run, replaced by recording fakes."""
+
+    def __init__(self, samples: list[SampledCommit]) -> None:
+        self.samples: list[SampledCommit] = samples
+        self.sampled: int = 0
+        self.checkouts: list[tuple[Path, str]] = []
+        self.full_scans: list[str] = []
+        self.updates: list[tuple[str, str]] = []
+        self.requests: list[WorktreeRequest] = []
+        self.pools: list[tuple[Path, Path]] = []
+        self.provisions: int = 0
+        self.cancelled: list[str] = []
+
+
+def install_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+    samples: list[SampledCommit],
+    *,
+    fetchers: list[str] | None = None,
+    on_checkout: Callable[[Path, str], Awaitable[None]] | None = None,
+    on_sample: Callable[[], None] | None = None,
+    counts: Callable[[str], dict[str, int]] | None = None,
+) -> Environment:
+    environment = Environment(samples)
+
+    async def fake_samples(
+        _repository: Path,
+        *,
+        interval: int,
+    ) -> list[SampledCommit]:
+        assert interval == cli.DEFAULT_INTERVAL
+        environment.sampled += 1
+        if on_sample is not None:
+            on_sample()
+        return samples
+
+    async def fake_checkout(repository: Path, commit: str) -> None:
+        environment.checkouts.append((repository, commit))
+        if on_checkout is not None:
+            await on_checkout(repository, commit)
+
+    async def fake_discovery(
+        _nixpkgs: Path,
+        _expression: Path,
+        *,
+        commit: str,
+    ) -> list[str]:
+        assert commit
+        return list(fetchers) if fetchers is not None else ["fetchurl"]
+
+    async def fake_counts(
+        _repository: Path,
+        commit: str,
+        sample_fetchers: list[str],
+    ) -> dict[str, int]:
+        environment.full_scans.append(commit)
+        if counts is not None:
+            return counts(commit)
+        return dict.fromkeys(sample_fetchers, 10)
+
+    async def fake_update(
+        _repository: Path,
+        newer_commit: str,
+        older_commit: str,
+        newer_counts: dict[str, int],
+    ) -> dict[str, int]:
+        environment.updates.append((newer_commit, older_commit))
+        return dict(newer_counts)
+
+    async def fake_provision(
+        *,
+        repository: Path,
+        pool_dir: Path,
+        requests: Sequence[WorktreeRequest],
+    ) -> dict[int, Path]:
+        environment.provisions += 1
+        environment.pools.append((repository, pool_dir))
+        environment.requests.extend(requests)
+        worktrees: dict[int, Path] = {}
+        for request in requests:
+            worker = pool_dir / f"worker-{request.index}"
+            worker.mkdir(parents=True, exist_ok=True)
+            worktrees[request.index] = worker
+        return worktrees
+
+    monkeypatch.setattr(cli, "sampled_commits", fake_samples)
+    monkeypatch.setattr(cli, "checkout", fake_checkout)
+    monkeypatch.setattr(cli, "discover_fetchers", fake_discovery)
+    monkeypatch.setattr(cli, "count_fetchers", fake_counts)
+    monkeypatch.setattr(cli, "update_fetcher_counts", fake_update)
+    monkeypatch.setattr(cli, "provision_worktrees", fake_provision)
+    return environment
+
+
+def parallel_config(tmp_path: Path, **overrides: object) -> Config:
+    settings: dict[str, object] = {
+        "nixpkgs": tmp_path / "nixpkgs",
+        "database": tmp_path / "fetchers.sqlite3",
+        "expression": tmp_path / "get-fetchers.nix",
+        "workers": 2,
+        "worktrees_dir": tmp_path / "pool",
+    }
+    settings.update(overrides)
+    return Config(**settings)  # pyright: ignore[reportArgumentType]
+
+
+def stored_counts(database_path: Path, column: str) -> dict[str, int | None]:
+    connection = sqlite3.connect(database_path)
+    try:
+        rows = connection.execute(
+            f'SELECT "commit", "{column}" FROM "fetchers"'  # noqa: S608
+        ).fetchall()
+    finally:
+        connection.close()
+    return {str(row[0]): row[1] for row in rows}
+
+
+def stored_fetcher_counts(database_path: Path) -> dict[str, dict[str, int]]:
+    """Read each row as its non-null fetcher columns.
+
+    Physical column order and the winner of a case-only collision depend on
+    which shard stored first, so tests must never assume either.
+    """
+    connection = sqlite3.connect(database_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute('SELECT * FROM "fetchers"').fetchall()
+    finally:
+        connection.close()
+    return {
+        str(row["commit"]): {
+            column: int(row[column])
+            for column in row.keys()  # noqa: SIM118
+            if column not in {"commit", "date", "is_skipped"}
+            and row[column] is not None
+        }
+        for row in rows
+    }
+
+
+def test_parse_args_accepts_worker_settings() -> None:
+    config = parse_args(["--workers", "4", "--worktrees-dir", "pool"])
+
+    assert config.workers == 4
+    assert config.worktrees_dir == Path("pool")
+
+
+def test_parse_args_rejects_nonpositive_workers() -> None:
+    with pytest.raises(SystemExit):
+        _ = parse_args(["--workers", "0"])
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_nonpositive_workers(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="workers must be positive"):
+        await run(parallel_config(tmp_path, workers=0))
+
+
+def test_shards_are_contiguous_and_exhaustive() -> None:
+    commits = indexed(samples_named(*(f"commit-{number}" for number in range(7))))
+
+    shards = cli.build_shards(commits, 3)
+
+    assert [shard.index for shard in shards] == [0, 1, 2]
+    assert [len(shard.commits) for shard in shards] == [2, 2, 3]
+    assert [item for shard in shards for item in shard.commits] == commits
+
+
+def test_more_workers_than_commits_keeps_shard_indices() -> None:
+    commits = indexed(samples_named("newest", "oldest"))
+
+    shards = cli.build_shards(commits, 4)
+
+    assert [shard.index for shard in shards if shard.commits] == [1, 3]
+    assert [shard.commits for shard in shards if shard.commits] == [
+        [commits[0]],
+        [commits[1]],
+    ]
+
+
+def test_pending_samples_keep_global_indices_and_neighbours() -> None:
+    commits = indexed(samples_named("a", "b", "c", "d"))
+    shard = cli.build_shards(commits, 2)[1]
+
+    pending = cli.build_pending(shard.commits, set())
+
+    assert [item.global_index for item in pending] == [2, 3]
+    assert pending[0].newer_sample is None
+    assert pending[1].newer_sample == commits[2][1]
+
+
+def test_pending_samples_reuse_an_adjacent_completed_neighbour() -> None:
+    commits = indexed(samples_named("a", "b", "c", "d"))
+    shard = cli.build_shards(commits, 2)[0]
+
+    pending = cli.build_pending(shard.commits, {"a"})
+
+    assert [item.sample.commit for item in pending] == ["b"]
+    assert pending[0].newer_sample == commits[0][1]
+
+
+def test_the_first_sample_of_a_shard_never_uses_another_shard() -> None:
+    commits = indexed(samples_named("a", "b", "c", "d"))
+    shard = cli.build_shards(commits, 2)[1]
+
+    pending = cli.build_pending(shard.commits, {"a", "b"})
+
+    assert [item.sample.commit for item in pending] == ["c", "d"]
+    assert pending[0].newer_sample is None
+
+
+@pytest.mark.asyncio
+async def test_single_worker_uses_the_checkout_without_a_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    environment = install_fakes(monkeypatch, samples_named("newest", "oldest"))
+    config = parallel_config(tmp_path, workers=1, worktrees_dir=None)
+
+    await run(config)
+
+    assert environment.checkouts == [
+        (config.nixpkgs, "newest"),
+        (config.nixpkgs, "oldest"),
+    ]
+    assert environment.provisions == 0
+    assert not list(tmp_path.glob(".nixpkgs-fetcher-counter-worktrees*"))  # noqa: ASYNC240
+
+
+@pytest.mark.asyncio
+async def test_parallel_run_processes_every_shard_in_its_own_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    samples = samples_named("a", "b", "c", "d")
+    environment = install_fakes(monkeypatch, samples)
+    config = parallel_config(tmp_path)
+
+    await run(config)
+
+    assert environment.provisions == 1
+    assert [
+        (request.index, request.initial_commit) for request in environment.requests
+    ] == [(0, "a"), (1, "c")]
+    assert sorted(environment.checkouts) == [
+        (tmp_path / "pool" / "worker-0", "a"),
+        (tmp_path / "pool" / "worker-0", "b"),
+        (tmp_path / "pool" / "worker-1", "c"),
+        (tmp_path / "pool" / "worker-1", "d"),
+    ]
+    assert set(stored_counts(config.database, "fetchurl")) == {"a", "b", "c", "d"}
+
+
+@pytest.mark.asyncio
+async def test_scheduled_full_scans_follow_the_global_history_position(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    samples = samples_named(*(f"commit-{number}" for number in range(6)))
+    environment = install_fakes(monkeypatch, samples)
+
+    await run(parallel_config(tmp_path, full_scan_interval=3))
+
+    assert sorted(environment.full_scans) == [
+        "commit-0",
+        "commit-2",
+        "commit-3",
+        "commit-5",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completed", [False, True])
+async def test_a_run_without_pending_work_only_takes_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    completed: bool,
+) -> None:
+    samples = samples_named("a", "b") if completed else []
+    environment = install_fakes(monkeypatch, samples)
+    config = parallel_config(tmp_path)
+    if completed:
+        async with FetcherDatabase(config.database) as database:
+            for sample in samples:
+                stored = await database.store(sample.commit, sample.date, {})
+                assert stored
+
+    await run(config)
+
+    pool = tmp_path / "pool"
+    assert environment.provisions == 0
+    assert environment.checkouts == []
+    assert (pool / "coordinator.lock").is_file()
+    assert list(pool.iterdir()) == [pool / "coordinator.lock"]
+    with worktree_pool_lock(pool):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_the_pool_lock_is_held_before_sampling_and_database_access(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = parallel_config(tmp_path)
+    contended: list[bool] = []
+
+    def on_sample() -> None:
+        assert not config.database.exists()
+        try:
+            with worktree_pool_lock(tmp_path / "pool"):
+                contended.append(False)
+        except WorktreePoolLockedError:
+            contended.append(True)
+
+    _ = install_fakes(
+        monkeypatch,
+        samples_named("a", "b"),
+        on_sample=on_sample,
+    )
+
+    await run(config)
+
+    assert contended == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_second_coordinator_fails_before_touching_anything(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    environment = install_fakes(monkeypatch, samples_named("a", "b"))
+    config = parallel_config(tmp_path)
+
+    with (
+        worktree_pool_lock(tmp_path / "pool"),
+        pytest.raises(WorktreePoolLockedError),
+    ):
+        await run(config)
+
+    assert environment.sampled == 0
+    assert not config.database.exists()
+
+
+@pytest.mark.asyncio
+async def test_run_derives_the_pool_from_the_nixpkgs_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    nixpkgs = tmp_path / "nixpkgs"
+    nixpkgs.mkdir()
+    environment = install_fakes(monkeypatch, samples_named("a", "b"))
+
+    await run(parallel_config(tmp_path, worktrees_dir=None))
+
+    pool = tmp_path / ".nixpkgs-fetcher-counter-worktrees"
+    assert environment.pools == [(nixpkgs, pool)]
+    assert (pool / "coordinator.lock").is_file()
+    assert (pool / "worker-0").is_dir()
+
+
+@pytest.mark.asyncio
+async def test_shards_make_progress_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    started = asyncio.Barrier(2)
+
+    async def on_checkout(_repository: Path, _commit: str) -> None:
+        _ = await asyncio.wait_for(started.wait(), timeout=5)
+
+    _ = install_fakes(
+        monkeypatch,
+        samples_named("a", "b", "c", "d"),
+        on_checkout=on_checkout,
+    )
+    config = parallel_config(tmp_path)
+
+    await run(config)
+
+    assert set(stored_counts(config.database, "fetchurl")) == {"a", "b", "c", "d"}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_shards_store_distinct_fetcher_columns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def on_checkout(_repository: Path, _commit: str) -> None:
+        await asyncio.sleep(0)
+
+    def counts(commit: str) -> dict[str, int]:
+        return {f"fetch{commit}": ord(commit[0])}
+
+    def discovery_counts(commit: str) -> dict[str, int]:
+        return counts(commit)
+
+    _ = install_fakes(
+        monkeypatch,
+        samples_named("a", "c"),
+        on_checkout=on_checkout,
+        counts=discovery_counts,
+    )
+    config = parallel_config(tmp_path)
+
+    await run(config)
+
+    assert stored_counts(config.database, "fetcha") == {"a": ord("a"), "c": None}
+    assert stored_counts(config.database, "fetchc") == {"a": None, "c": ord("c")}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_shards_resolve_case_colliding_fetchers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def counts(commit: str) -> dict[str, int]:
+        name = "fetchFromGitHub" if commit == "a" else "fetchFromGithub"
+        return {name: 1 if commit == "a" else 2}
+
+    _ = install_fakes(monkeypatch, samples_named("a", "c"), counts=counts)
+    config = parallel_config(tmp_path)
+
+    await run(config)
+
+    rows = stored_fetcher_counts(config.database)
+    values = {commit: sorted(counts.values()) for commit, counts in rows.items()}
+    assert values == {"a": [1], "c": [2]}
+    columns = {column for counts in rows.values() for column in counts}
+    assert {column.casefold() for column in columns} == {
+        "fetchfromgithub",
+        "fetchfromgithub__case_collision_1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_failing_shard_lets_its_siblings_finish(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def on_checkout(_repository: Path, commit: str) -> None:
+        if commit == "a":
+            raise RuntimeError("shard 0 broke")
+        await asyncio.sleep(0)
+
+    _ = install_fakes(
+        monkeypatch,
+        samples_named("a", "b", "c", "d"),
+        on_checkout=on_checkout,
+    )
+    config = parallel_config(tmp_path)
+
+    with pytest.raises(ExceptionGroup) as error:
+        await run(config)
+
+    failures = error.value.exceptions
+    assert len(failures) == 1
+    failure = failures[0]
+    assert isinstance(failure, cli.ShardError)
+    assert failure.shard_index == 0
+    assert isinstance(failure.cause, RuntimeError)
+    assert set(stored_counts(config.database, "fetchurl")) == {"c", "d"}
+    with worktree_pool_lock(tmp_path / "pool"):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_an_independently_cancelled_shard_reraises_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def on_checkout(_repository: Path, commit: str) -> None:
+        if commit == "a":
+            raise asyncio.CancelledError
+        await asyncio.sleep(0)
+
+    _ = install_fakes(
+        monkeypatch,
+        samples_named("a", "b", "c", "d"),
+        on_checkout=on_checkout,
+    )
+    config = parallel_config(tmp_path)
+
+    with pytest.raises(asyncio.CancelledError):
+        await run(config)
+
+    assert set(stored_counts(config.database, "fetchurl")) == {"c", "d"}
+    with worktree_pool_lock(tmp_path / "pool"):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_external_cancellation_cancels_every_shard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    running = asyncio.Barrier(2)
+    cancelled: list[str] = []
+
+    async def on_checkout(_repository: Path, commit: str) -> None:
+        try:
+            _ = await running.wait()
+            _ = await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(commit)
+            raise
+
+    _ = install_fakes(
+        monkeypatch,
+        samples_named("a", "b", "c", "d"),
+        on_checkout=on_checkout,
+    )
+    config = parallel_config(tmp_path)
+    counting = asyncio.create_task(run(config))
+    await asyncio.sleep(0.05)
+
+    _ = counting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await counting
+
+    assert sorted(cancelled) == ["a", "c"]
+    with worktree_pool_lock(tmp_path / "pool"):
+        pass
+
+
+def test_main_derives_the_pool_from_the_resolved_nixpkgs_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    nixpkgs = tmp_path / "nixpkgs"
+    nixpkgs.mkdir()
+    link = tmp_path / "link-to-nixpkgs"
+    link.symlink_to(nixpkgs)
+    expression = tmp_path / "get-fetchers.nix"
+    _ = expression.write_text("[]")
+    configurations: list[Config] = []
+
+    async def fake_run(config: Config) -> None:
+        configurations.append(config)
+
+    def fake_configure_logging(_log_level: str) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    monkeypatch.setattr(cli, "configure_logging", fake_configure_logging)
+
+    for checkout_path in (nixpkgs, link):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "fetcher-counter",
+                "--nixpkgs",
+                str(checkout_path),
+                "--database",
+                str(tmp_path / "data" / "fetchers.sqlite3"),
+                "--expression",
+                str(expression),
+                "--workers",
+                "2",
+            ],
+        )
+        cli.main()
+
+    pool = tmp_path / ".nixpkgs-fetcher-counter-worktrees"
+    assert [config.worktrees_dir for config in configurations] == [pool, pool]
+    assert [config.nixpkgs for config in configurations] == [nixpkgs, nixpkgs]
+
+
+def test_main_resolves_an_explicit_worktrees_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    nixpkgs = tmp_path / "nixpkgs"
+    nixpkgs.mkdir()
+    expression = tmp_path / "get-fetchers.nix"
+    _ = expression.write_text("[]")
+    configurations: list[Config] = []
+
+    async def fake_run(config: Config) -> None:
+        configurations.append(config)
+
+    def fake_configure_logging(_log_level: str) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    monkeypatch.setattr(cli, "configure_logging", fake_configure_logging)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "fetcher-counter",
+            "--nixpkgs",
+            str(nixpkgs),
+            "--database",
+            str(tmp_path / "fetchers.sqlite3"),
+            "--expression",
+            str(expression),
+            "--worktrees-dir",
+            str(tmp_path / "pool" / ".." / "pool"),
+        ],
+    )
+
+    cli.main()
+
+    assert configurations[0].worktrees_dir == tmp_path / "pool"

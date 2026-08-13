@@ -27,16 +27,60 @@ uv run fetcher-counter \
   --database /path/to/fetchers.sqlite3 \
   --interval 50 \
   --full-scan-interval 25 \
+  --workers 4 \
+  --worktrees-dir /path/to/worktree-pool \
   --log-level DEBUG
 ```
 
 `--log-level` accepts `TRACE`, `DEBUG`, `INFO`, `SUCCESS`, `WARNING`, `ERROR`, or
-`CRITICAL` and defaults to `INFO`.
+`CRITICAL` and defaults to `INFO`. Each log line is labelled with the shard that
+emitted it, or with `main` for the coordinator itself.
 
-The process checks out historical revisions directly in the supplied Nixpkgs
-checkout. It deliberately does not restore the original revision after success
-or failure. Do not run it against a checkout whose current state you need to
-preserve.
+With the default `--workers 1`, the process checks out historical revisions
+directly in the supplied Nixpkgs checkout. It deliberately does not restore the
+original revision after success or failure. Do not run it against a checkout
+whose current state you need to preserve.
+
+## Parallel shards
+
+`--workers N` with `N` greater than one splits the sampled history into `N`
+contiguous shards and processes them concurrently inside one process. The
+supplied `--nixpkgs` checkout is then only used to compute history and as the
+source for worker worktrees; it is no longer checked out to every historical
+revision itself.
+
+Each shard works in a persistent Git worktree under a managed pool directory,
+`.<nixpkgs>-fetcher-counter-worktrees` next to the resolved `--nixpkgs` path by
+default and overridable with `--worktrees-dir`:
+
+```
+<pool>/coordinator.lock
+<pool>/worker-0
+<pool>/worker-1
+```
+
+The pool is locked with an advisory lock on `coordinator.lock` for the whole
+run, before history is sampled and before the database is opened. A second
+invocation using the same pool fails immediately instead of waiting. The pool
+directory and its lock file are created even when no work turns out to be
+pending; the lock file stays on disk between runs, because the advisory lock
+rather than the file marks ownership.
+
+Worker worktrees are reused across runs, but only when Git reports them as
+registered, unlocked, not prunable, and entirely pristine, including untracked
+and ignored files. A stray `.nix` file would otherwise be counted after a later
+historical checkout un-ignores it. Nothing in the pool is ever cleaned, reset,
+or deleted: unexpected state is reported so it can be inspected manually.
+
+Shards share the single database connection, so all writes stay serialized and
+each shard's progress is durable on its own. If one shard fails, its siblings
+finish first and the failure is reported afterwards. Because the shard that
+writes first decides them, the physical order of fetcher columns and the winner
+of a case-only collision vary between runs; stored values do not.
+
+Concurrent `fetcher-counter` invocations against the same Nixpkgs repository or
+the same database file are unsupported regardless of worktree pool. The pool
+lock protects one pool, not a repository or a database.
 
 ## History and counting semantics
 
@@ -76,6 +120,13 @@ changed, the sample has no newer neighbor, or the diff cannot produce
 trustworthy non-negative counts. This lets an interrupted run resume
 incrementally from its adjacent completed row while keeping the safety checkpoints
 anchored to stable positions in the sampled history.
+
+Shard boundaries are cut over the full list of sampled commits, so each sample
+keeps the position that decides its full-scan checkpoint no matter how many
+workers run. Within a shard, a pending sample still reuses its immediately newer
+neighbor, completed or not. The first sample of a shard is the exception: it
+always uses a full scan, because reading the neighboring shard's row would make
+that choice depend on scheduling order.
 
 ## Database
 

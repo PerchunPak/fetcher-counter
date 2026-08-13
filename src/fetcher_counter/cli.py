@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import itertools
-import sys
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -9,6 +8,17 @@ from pathlib import Path
 from time import perf_counter
 
 from loguru import logger
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    ProgressColumn,
+    TaskID,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.text import Text
 
 from fetcher_counter.counting import (
     IncrementalCountError,
@@ -38,6 +48,7 @@ LOG_FORMAT = (
     + "<level>{message}</level>"
 )
 COORDINATOR_SHARD = "main"
+console = Console(stderr=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +77,12 @@ class PendingSample:
 class ActiveShard:
     index: int
     pending: list[PendingSample]
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressTasks:
+    total: TaskID
+    shard: TaskID
 
 
 class ShardError(RuntimeError):
@@ -164,10 +181,27 @@ def parse_args(arguments: list[str] | None = None) -> Config:
     )
 
 
+def progress_columns() -> tuple[str | ProgressColumn, ...]:
+    return (
+        "[progress.description]{task.description}",
+        MofNCompleteColumn(),
+        BarColumn(),
+        "[",
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        "]",
+    )
+
+
 def configure_logging(log_level: str) -> None:
     logger.remove()
     _ = logger.configure(extra={"shard": COORDINATOR_SHARD})
-    _ = logger.add(sys.stderr, level=log_level, format=LOG_FORMAT)
+    _ = logger.add(
+        lambda message: console.print(Text.from_ansi(message), end=""),
+        level=log_level,
+        format=LOG_FORMAT,
+        colorize=console.is_terminal,
+    )
 
 
 @contextmanager
@@ -248,76 +282,82 @@ async def run_shard(
     worktree: Path,
     pending: Sequence[PendingSample],
     database: FetcherDatabase,
+    progress: Progress,
+    tasks: ProgressTasks,
 ) -> None:
     for position, item in enumerate(pending, start=1):
         sample = item.sample
         logger.info("Processing {} ({}/{})", sample.commit, position, len(pending))
-        with timed("Checkout", sample.commit):
-            await checkout(worktree, sample.commit)
         try:
-            with timed("Discovery", sample.commit):
-                fetchers = await discover_fetchers(
-                    worktree,
-                    config.expression,
-                    commit=sample.commit,
-                )
-        except FetcherDiscoveryError as error:
-            logger.warning("Skipping {}: {}", sample.commit, error)
-            _ = await database.store(
-                sample.commit,
-                sample.date,
-                {},
-                is_skipped=True,
-            )
-            continue
-        logger.debug("Active fetchers at {}: {}", sample.commit, fetchers)
-        counts: dict[str, int] | None = None
-        scheduled_full_scan = (
-            item.global_index + 1
-        ) % config.full_scan_interval == 0
-        if scheduled_full_scan:
-            logger.debug(
-                "Using scheduled full scan at {} (sample iteration {})",
-                sample.commit,
-                item.global_index + 1,
-            )
-        if item.newer_sample is not None and not scheduled_full_scan:
-            newer_counts = await database.counts_for_commit(
-                item.newer_sample.commit,
-                fetchers,
-            )
-            if newer_counts is not None:
-                try:
-                    with timed("Incremental count", sample.commit):
-                        counts = await update_fetcher_counts(
-                            worktree,
-                            item.newer_sample.commit,
-                            sample.commit,
-                            newer_counts,
-                        )
-                except IncrementalCountError as error:
-                    logger.warning(
-                        "Incremental count at {} failed; using full scan: {}",
-                        sample.commit,
-                        error,
+            with timed("Checkout", sample.commit):
+                await checkout(worktree, sample.commit)
+            try:
+                with timed("Discovery", sample.commit):
+                    fetchers = await discover_fetchers(
+                        worktree,
+                        config.expression,
+                        commit=sample.commit,
                     )
-                else:
-                    logger.debug(
-                        "Used counts from adjacent commit {} for {}",
-                        item.newer_sample.commit,
-                        sample.commit,
-                    )
-
-        if counts is None:
-            logger.debug("Using full fetcher scan at {}", sample.commit)
-            with timed("Full scan", sample.commit):
-                counts = await count_fetchers(
-                    worktree,
+            except FetcherDiscoveryError as error:
+                logger.warning("Skipping {}: {}", sample.commit, error)
+                _ = await database.store(
                     sample.commit,
+                    sample.date,
+                    {},
+                    is_skipped=True,
+                )
+                continue
+            logger.debug("Active fetchers at {}: {}", sample.commit, fetchers)
+            counts: dict[str, int] | None = None
+            scheduled_full_scan = (
+                item.global_index + 1
+            ) % config.full_scan_interval == 0
+            if scheduled_full_scan:
+                logger.debug(
+                    "Using scheduled full scan at {} (sample iteration {})",
+                    sample.commit,
+                    item.global_index + 1,
+                )
+            if item.newer_sample is not None and not scheduled_full_scan:
+                newer_counts = await database.counts_for_commit(
+                    item.newer_sample.commit,
                     fetchers,
                 )
-        logger.debug("Persisting counts at {}: {}", sample.commit, counts)
-        _ = await database.store(sample.commit, sample.date, counts)
+                if newer_counts is not None:
+                    try:
+                        with timed("Incremental count", sample.commit):
+                            counts = await update_fetcher_counts(
+                                worktree,
+                                item.newer_sample.commit,
+                                sample.commit,
+                                newer_counts,
+                            )
+                    except IncrementalCountError as error:
+                        logger.warning(
+                            "Incremental count at {} failed; using full scan: {}",
+                            sample.commit,
+                            error,
+                        )
+                    else:
+                        logger.debug(
+                            "Used counts from adjacent commit {} for {}",
+                            item.newer_sample.commit,
+                            sample.commit,
+                        )
+
+            if counts is None:
+                logger.debug("Using full fetcher scan at {}", sample.commit)
+                with timed("Full scan", sample.commit):
+                    counts = await count_fetchers(
+                        worktree,
+                        sample.commit,
+                        fetchers,
+                    )
+            logger.debug("Persisting counts at {}: {}", sample.commit, counts)
+            _ = await database.store(sample.commit, sample.date, counts)
+        finally:
+            progress.advance(tasks.shard)
+            progress.advance(tasks.total)
 
 
 async def _run_labelled_shard(
@@ -326,6 +366,8 @@ async def _run_labelled_shard(
     shard: ActiveShard,
     worktree: Path,
     database: FetcherDatabase,
+    progress: Progress,
+    tasks: ProgressTasks,
 ) -> None:
     with logger.contextualize(shard=f"shard {shard.index}"):
         logger.info(
@@ -338,6 +380,8 @@ async def _run_labelled_shard(
             worktree=worktree,
             pending=shard.pending,
             database=database,
+            progress=progress,
+            tasks=tasks,
         )
 
 
@@ -357,12 +401,19 @@ async def run_single_worker(config: Config) -> None:
             len(commits),
             len(pending),
         )
-        await run_shard(
-            config,
-            worktree=config.nixpkgs,
-            pending=pending,
-            database=database,
-        )
+        with Progress(*progress_columns(), console=console) as progress:
+            tasks = ProgressTasks(
+                total=progress.add_task("Total", total=len(pending)),
+                shard=progress.add_task("Shard 0", total=len(pending)),
+            )
+            await run_shard(
+                config,
+                worktree=config.nixpkgs,
+                pending=pending,
+                database=database,
+                progress=progress,
+                tasks=tasks,
+            )
 
 
 def _shard_outcome_failures(
@@ -430,18 +481,32 @@ async def run_parallel(config: Config) -> None:
                     for shard in active_shards
                 ],
             )
-            results = await asyncio.gather(
-                *(
-                    _run_labelled_shard(
-                        config,
-                        shard=shard,
-                        worktree=worktrees[shard.index],
-                        database=database,
+            with Progress(*progress_columns(), console=console) as progress:
+                total_task = progress.add_task("Total", total=total_pending)
+                shard_tasks = {
+                    shard.index: progress.add_task(
+                        f"Shard {shard.index}",
+                        total=len(shard.pending),
                     )
                     for shard in active_shards
-                ),
-                return_exceptions=True,
-            )
+                }
+                results = await asyncio.gather(
+                    *(
+                        _run_labelled_shard(
+                            config,
+                            shard=shard,
+                            worktree=worktrees[shard.index],
+                            database=database,
+                            progress=progress,
+                            tasks=ProgressTasks(
+                                total=total_task,
+                                shard=shard_tasks[shard.index],
+                            ),
+                        )
+                        for shard in active_shards
+                    ),
+                    return_exceptions=True,
+                )
 
     failures = _shard_outcome_failures(
         list(zip(active_shards, results, strict=True))

@@ -3,9 +3,11 @@ import sqlite3
 import sys
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
+from typing import ClassVar, Self
 
 import pytest
 from loguru import logger
+from rich.text import Text
 
 from fetcher_counter import cli
 from fetcher_counter.cli import Config, parse_args, run
@@ -66,6 +68,13 @@ def test_configure_logging_replaces_default_sink(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[object, ...]] = []
+    printed: list[tuple[Text, str]] = []
+
+    class FakeConsole:
+        is_terminal: bool = True
+
+        def print(self, message: Text, *, end: str) -> None:
+            printed.append((message, end))
 
     class FakeLogger:
         def remove(self) -> None:
@@ -74,10 +83,19 @@ def test_configure_logging_replaces_default_sink(
         def configure(self, *, extra: dict[str, str]) -> None:
             calls.append(("configure", extra))
 
-        def add(self, sink: object, *, level: str, format: str) -> int:
-            calls.append(("add", sink, level, format))
+        def add(
+            self,
+            sink: Callable[[str], None],
+            *,
+            level: str,
+            format: str,
+            colorize: bool,
+        ) -> int:
+            calls.append(("add", level, format, colorize))
+            sink("\x1b[31mwarning\x1b[0m\n")
             return 1
 
+    monkeypatch.setattr(cli, "console", FakeConsole())
     monkeypatch.setattr(cli, "logger", FakeLogger())
 
     cli.configure_logging("WARNING")
@@ -85,8 +103,22 @@ def test_configure_logging_replaces_default_sink(
     assert calls == [
         ("remove",),
         ("configure", {"shard": "main"}),
-        ("add", sys.stderr, "WARNING", cli.LOG_FORMAT),
+        ("add", "WARNING", cli.LOG_FORMAT, True),
     ]
+    assert printed[0][0].plain == "warning"
+    assert printed[0][1] == ""
+
+
+def test_progress_columns_match_nupd_layout() -> None:
+    columns = cli.progress_columns()
+
+    assert columns[0] == "[progress.description]{task.description}"
+    assert type(columns[1]).__name__ == "MofNCompleteColumn"
+    assert type(columns[2]).__name__ == "BarColumn"
+    assert columns[3] == "["
+    assert type(columns[4]).__name__ == "TimeElapsedColumn"
+    assert type(columns[5]).__name__ == "TimeRemainingColumn"
+    assert columns[6] == "]"
 
 
 def test_log_format_labels_coordinator_and_shard_messages() -> None:
@@ -633,6 +665,38 @@ def indexed(samples: list[SampledCommit]) -> list[tuple[int, SampledCommit]]:
     return list(enumerate(samples))
 
 
+class RecordingProgress:
+    instances: ClassVar[list[RecordingProgress]] = []
+
+    def __init__(self, *_columns: object, console: object) -> None:
+        self.console: object = console
+        self.tasks: list[tuple[int, str, int]] = []
+        self.advanced: list[int] = []
+        self.instances.append(self)
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def add_task(self, description: str, *, total: int) -> int:
+        task_id = len(self.tasks)
+        self.tasks.append((task_id, description, total))
+        return task_id
+
+    def advance(self, task_id: int) -> None:
+        self.advanced.append(task_id)
+
+
+def install_recording_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[RecordingProgress]:
+    RecordingProgress.instances = []
+    monkeypatch.setattr(cli, "Progress", RecordingProgress)
+    return RecordingProgress.instances
+
+
 class Environment:
     """The expensive stages of a run, replaced by recording fakes."""
 
@@ -890,6 +954,95 @@ async def test_single_worker_uses_the_checkout_without_a_pool(
     ]
     assert environment.provisions == 0
     assert not list(tmp_path.glob(".nixpkgs-fetcher-counter-worktrees*"))  # noqa: ASYNC240
+
+
+@pytest.mark.asyncio
+async def test_single_worker_shows_total_and_shard_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _ = install_fakes(monkeypatch, samples_named("newest", "oldest"))
+    progress_instances = install_recording_progress(monkeypatch)
+
+    await run(parallel_config(tmp_path, workers=1, worktrees_dir=None))
+
+    assert len(progress_instances) == 1
+    progress = progress_instances[0]
+    assert progress.tasks == [(0, "Total", 2), (1, "Shard 0", 2)]
+    assert progress.advanced == [1, 0, 1, 0]
+
+
+@pytest.mark.asyncio
+async def test_skipped_evaluation_advances_both_progress_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _ = install_fakes(monkeypatch, samples_named("failed"))
+    progress_instances = install_recording_progress(monkeypatch)
+
+    async def fail_discovery(
+        _nixpkgs: Path,
+        _expression: Path,
+        *,
+        commit: str,
+    ) -> list[str]:
+        assert commit == "failed"
+        raise FetcherDiscoveryError("cannot evaluate")
+
+    monkeypatch.setattr(cli, "discover_fetchers", fail_discovery)
+
+    await run(parallel_config(tmp_path, workers=1, worktrees_dir=None))
+
+    progress = progress_instances[0]
+    assert progress.advanced == [1, 0]
+    connection = sqlite3.connect(tmp_path / "fetchers.sqlite3")
+    row = connection.execute(
+        'SELECT "is_skipped" FROM "fetchers" WHERE "commit" = "failed"'
+    ).fetchone()
+    connection.close()
+    assert row == (1,)
+
+
+@pytest.mark.asyncio
+async def test_parallel_run_shows_total_and_each_active_shard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _ = install_fakes(monkeypatch, samples_named("a", "b", "c", "d"))
+    progress_instances = install_recording_progress(monkeypatch)
+
+    await run(parallel_config(tmp_path))
+
+    progress = progress_instances[0]
+    assert progress.tasks == [
+        (0, "Total", 4),
+        (1, "Shard 0", 2),
+        (2, "Shard 1", 2),
+    ]
+    assert progress.advanced.count(0) == 4
+    assert progress.advanced.count(1) == 2
+    assert progress.advanced.count(2) == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_sample_advances_progress_before_propagating(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def fail_checkout(_repository: Path, _commit: str) -> None:
+        raise RuntimeError("checkout failed")
+
+    _ = install_fakes(
+        monkeypatch,
+        samples_named("failed"),
+        on_checkout=fail_checkout,
+    )
+    progress_instances = install_recording_progress(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="checkout failed"):
+        await run(parallel_config(tmp_path, workers=1, worktrees_dir=None))
+
+    assert progress_instances[0].advanced == [1, 0]
 
 
 @pytest.mark.asyncio

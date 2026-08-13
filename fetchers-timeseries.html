@@ -645,6 +645,7 @@ else if (typeof exports === 'object'){
       scale: "log",
       visible: new Set(),
       hoverIndex: null,
+      hoverSeriesKey: null,
       loading: false,
       zoomStart: 0,
       zoomEnd: null,
@@ -844,6 +845,7 @@ else if (typeof exports === 'object'){
         state.visible = new Set(SERIES.map(series => series.key));
         state.range = "all";
         state.hoverIndex = null;
+        state.hoverSeriesKey = null;
         rangeSelect.value = "all";
         seriesSearch.value = "";
         resetZoom(false);
@@ -1038,6 +1040,7 @@ else if (typeof exports === 'object'){
       yMax = state.scale === "log" ? Math.ceil(dataMax) : dataMax * 1.06;
       tooltip.hidden = true;
       state.hoverIndex = null;
+      state.hoverSeriesKey = null;
       configureChart();
       emptyState.hidden = parsedData.length > 0;
       if (viewData.length) {
@@ -1051,37 +1054,56 @@ else if (typeof exports === 'object'){
       updateZoomButtons();
     }
 
-    function tooltipContent(index) {
+    function tooltipContent(index, series) {
       const row = viewData[index];
       tooltip.replaceChildren();
       const date = document.createElement("div");
       date.className = "tooltip-date";
       date.textContent = formatDate.format(new Date(row.timestamp));
       tooltip.appendChild(date);
-      for (const series of SERIES) {
-        if (!state.visible.has(series.key)) continue;
-        const item = document.createElement("div");
-        item.className = "tooltip-row";
-        const key = document.createElement("span");
-        key.className = "tooltip-key";
-        key.style.background = seriesColor(series);
-        const name = document.createElement("span");
-        name.className = "tooltip-name";
-        name.textContent = series.label;
-        const value = document.createElement("strong");
-        value.className = "tooltip-value";
-        value.textContent = row[series.key] == null ? "—" : formatNumber.format(row[series.key]);
-        item.append(key, name, value);
-        tooltip.appendChild(item);
-      }
+      const item = document.createElement("div");
+      item.className = "tooltip-row";
+      const key = document.createElement("span");
+      key.className = "tooltip-key";
+      key.style.background = seriesColor(series);
+      const name = document.createElement("span");
+      name.className = "tooltip-name";
+      name.textContent = series.label;
+      const value = document.createElement("strong");
+      value.className = "tooltip-value";
+      value.textContent = row[series.key] == null ? "—" : formatNumber.format(row[series.key]);
+      item.append(key, name, value);
+      tooltip.appendChild(item);
     }
 
-    function showHover(index) {
+    function focusedSeries(index, pointerY) {
+      const row = viewData[index];
+      const visibleSeries = SERIES.filter(series => state.visible.has(series.key) && row[series.key] != null);
+      if (!visibleSeries.length) return null;
+      if (pointerY == null) {
+        return visibleSeries.find(series => series.key === state.hoverSeriesKey) ?? visibleSeries[0];
+      }
+      return visibleSeries.reduce((nearest, series) => {
+        const y = chartInstance.scales.y.getPixelForValue(transformed(row[series.key]));
+        return Math.abs(y - pointerY) < nearest.distance ? { series, distance: Math.abs(y - pointerY) } : nearest;
+      }, { series: visibleSeries[0], distance: Infinity }).series;
+    }
+
+    function showHover(index, pointerY) {
       if (!viewData.length) return;
       index = Math.max(0, Math.min(viewData.length - 1, index));
+      const series = focusedSeries(index, pointerY);
+      if (!series) {
+        state.hoverIndex = null;
+        state.hoverSeriesKey = null;
+        tooltip.hidden = true;
+        chartInstance.draw();
+        return;
+      }
       state.hoverIndex = index;
+      state.hoverSeriesKey = series.key;
       const x = xFor(index);
-      tooltipContent(index);
+      tooltipContent(index, series);
       tooltip.hidden = false;
       const tooltipWidth = tooltip.offsetWidth;
       const left = x + 14 + tooltipWidth > chartWrap.clientWidth ? x - tooltipWidth - 14 : x + 14;
@@ -1098,6 +1120,10 @@ else if (typeof exports === 'object'){
 
     function pointerIndex(event) {
       return Math.round(pointerRatio(event) * (viewData.length - 1));
+    }
+
+    function pointerY(event) {
+      return event.clientY - chartWrap.getBoundingClientRect().top;
     }
 
     function updateTable() {
@@ -1227,6 +1253,7 @@ else if (typeof exports === 'object'){
       chartWrap.setPointerCapture(event.pointerId);
       chartWrap.style.cursor = "grabbing";
       state.hoverIndex = null;
+      state.hoverSeriesKey = null;
       tooltip.hidden = true;
     });
 
@@ -1239,7 +1266,7 @@ else if (typeof exports === 'object'){
         render();
         return;
       }
-      showHover(pointerIndex(event));
+      showHover(pointerIndex(event), pointerY(event));
     });
 
     function endDrag(event) {
@@ -1255,12 +1282,14 @@ else if (typeof exports === 'object'){
     chartWrap.addEventListener("pointerleave", event => {
       if (state.dragging) return;
       state.hoverIndex = null;
+      state.hoverSeriesKey = null;
       tooltip.hidden = true;
       chartInstance.draw();
     });
     chartWrap.addEventListener("focus", () => showHover(state.hoverIndex ?? viewData.length - 1));
     chartWrap.addEventListener("blur", () => {
       state.hoverIndex = null;
+      state.hoverSeriesKey = null;
       tooltip.hidden = true;
       chartInstance.draw();
     });

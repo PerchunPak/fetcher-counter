@@ -1059,7 +1059,7 @@ else if (typeof exports === 'object'){
       tooltip.replaceChildren();
       const date = document.createElement("div");
       date.className = "tooltip-date";
-      date.textContent = formatDate.format(new Date(row.timestamp));
+      date.textContent = `${formatDate.format(new Date(row.timestamp))} · ${row.commit.slice(0, 12)}`;
       tooltip.appendChild(date);
       const item = document.createElement("div");
       item.className = "tooltip-row";

@@ -124,6 +124,7 @@ exclude = [
   ".venv",
   "data",
   "nixpkgs",
+  "**/*-fetcher-counter-worktrees", # worker checkouts of Nixpkgs
 ]
 
 # Diagnostic behavior settings

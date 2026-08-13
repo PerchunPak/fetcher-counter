@@ -43,8 +43,13 @@ whose current state you need to preserve.
 
 ## Parallel shards
 
-`--workers N` with `N` greater than one splits the sampled history into `N`
-contiguous shards and processes them concurrently inside one process. The
+`--workers N` with `N` greater than one splits the samples still to be counted
+into `N` contiguous shards and processes them concurrently inside one process.
+Splitting the pending work rather than the whole history keeps every worker busy
+on a resumed run, where most of the history is already stored; the cost is that
+shard boundaries move between runs, so a different sample forfeits its neighbor
+each time. Stored rows are keyed by commit, so nothing depends on where the
+boundaries fell in an earlier run. The
 supplied `--nixpkgs` checkout is then only used to compute history and as the
 source for worker worktrees; it is no longer checked out to every historical
 revision itself.
@@ -121,12 +126,14 @@ trustworthy non-negative counts. This lets an interrupted run resume
 incrementally from its adjacent completed row while keeping the safety checkpoints
 anchored to stable positions in the sampled history.
 
-Shard boundaries are cut over the full list of sampled commits, so each sample
-keeps the position that decides its full-scan checkpoint no matter how many
-workers run. Within a shard, a pending sample still reuses its immediately newer
-neighbor, completed or not. The first sample of a shard is the exception: it
-always uses a full scan, because reading the neighboring shard's row would make
-that choice depend on scheduling order.
+Every sample keeps the history position that decides its full-scan checkpoint,
+no matter how many workers run. A pending sample reuses its immediately newer
+neighbor, completed or not, exactly as a sequential run does. The one exception
+is the first sample of a shard whose neighbor is itself pending in another
+shard: that sample uses a full scan, because reading a row another shard is
+about to write would make the choice depend on scheduling order. A boundary
+sample whose neighbor was already stored by an earlier run still counts
+incrementally.
 
 ## Database
 

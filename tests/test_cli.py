@@ -792,57 +792,86 @@ async def test_run_rejects_nonpositive_workers(tmp_path: Path) -> None:
         await run(parallel_config(tmp_path, workers=0))
 
 
-def test_shards_are_contiguous_and_exhaustive() -> None:
-    commits = indexed(samples_named(*(f"commit-{number}" for number in range(7))))
+def shard_pending(
+    samples: list[SampledCommit],
+    workers: int,
+    completed: set[str] | None = None,
+) -> list[cli.ActiveShard]:
+    stored: set[str] = completed if completed is not None else set()
+    return cli.split_pending(
+        cli.build_pending(indexed(samples), stored),
+        workers,
+        stored,
+    )
 
-    shards = cli.build_shards(commits, 3)
+
+def test_shards_split_pending_work_contiguously_and_exhaustively() -> None:
+    samples = samples_named(*(f"commit-{number}" for number in range(7)))
+
+    shards = shard_pending(samples, 3)
 
     assert [shard.index for shard in shards] == [0, 1, 2]
-    assert [len(shard.commits) for shard in shards] == [2, 2, 3]
-    assert [item for shard in shards for item in shard.commits] == commits
-
-
-def test_more_workers_than_commits_keeps_shard_indices() -> None:
-    commits = indexed(samples_named("newest", "oldest"))
-
-    shards = cli.build_shards(commits, 4)
-
-    assert [shard.index for shard in shards if shard.commits] == [1, 3]
-    assert [shard.commits for shard in shards if shard.commits] == [
-        [commits[0]],
-        [commits[1]],
+    assert [len(shard.pending) for shard in shards] == [2, 2, 3]
+    assert [item.global_index for shard in shards for item in shard.pending] == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
     ]
 
 
+def test_shards_stay_balanced_when_most_of_the_history_is_stored() -> None:
+    samples = samples_named(*(f"commit-{number}" for number in range(6)))
+    completed = {f"commit-{number}" for number in range(4)}
+
+    shards = shard_pending(samples, 2, completed)
+
+    assert [
+        [item.sample.commit for item in shard.pending] for shard in shards
+    ] == [["commit-4"], ["commit-5"]]
+
+
+def test_more_workers_than_pending_samples_keeps_shard_indices() -> None:
+    shards = shard_pending(samples_named("newest", "oldest"), 4)
+
+    assert [shard.index for shard in shards if shard.pending] == [1, 3]
+    assert [
+        [item.sample.commit for item in shard.pending]
+        for shard in shards
+        if shard.pending
+    ] == [["newest"], ["oldest"]]
+
+
 def test_pending_samples_keep_global_indices_and_neighbours() -> None:
-    commits = indexed(samples_named("a", "b", "c", "d"))
-    shard = cli.build_shards(commits, 2)[1]
+    samples = samples_named("a", "b", "c", "d")
 
-    pending = cli.build_pending(shard.commits, set())
+    shards = shard_pending(samples, 2)
 
-    assert [item.global_index for item in pending] == [2, 3]
-    assert pending[0].newer_sample is None
-    assert pending[1].newer_sample == commits[2][1]
-
-
-def test_pending_samples_reuse_an_adjacent_completed_neighbour() -> None:
-    commits = indexed(samples_named("a", "b", "c", "d"))
-    shard = cli.build_shards(commits, 2)[0]
-
-    pending = cli.build_pending(shard.commits, {"a"})
-
-    assert [item.sample.commit for item in pending] == ["b"]
-    assert pending[0].newer_sample == commits[0][1]
+    assert [item.global_index for item in shards[1].pending] == [2, 3]
+    assert shards[0].pending[1].newer_sample == samples[0]
+    assert shards[1].pending[1].newer_sample == samples[2]
 
 
-def test_the_first_sample_of_a_shard_never_uses_another_shard() -> None:
-    commits = indexed(samples_named("a", "b", "c", "d"))
-    shard = cli.build_shards(commits, 2)[1]
+def test_a_shard_boundary_reuses_an_already_stored_neighbour() -> None:
+    samples = samples_named("a", "b", "c", "d")
 
-    pending = cli.build_pending(shard.commits, {"a", "b"})
+    shards = shard_pending(samples, 2, {"a", "b"})
 
-    assert [item.sample.commit for item in pending] == ["c", "d"]
-    assert pending[0].newer_sample is None
+    assert [item.sample.commit for item in shards[0].pending] == ["c"]
+    assert shards[0].pending[0].newer_sample == samples[1]
+
+
+def test_a_shard_boundary_never_uses_another_shard_pending_neighbour() -> None:
+    samples = samples_named("a", "b", "c", "d")
+
+    shards = shard_pending(samples, 2)
+
+    assert [item.sample.commit for item in shards[1].pending] == ["c", "d"]
+    assert shards[1].pending[0].newer_sample is None
+    assert shards[0].pending[0].newer_sample is None
 
 
 @pytest.mark.asyncio
@@ -1239,3 +1268,42 @@ def test_main_resolves_an_explicit_worktrees_directory(
     cli.main()
 
     assert configurations[0].worktrees_dir == tmp_path / "pool"
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_parallel_run_balances_pending_work(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    samples = samples_named(*(f"commit-{number}" for number in range(6)))
+    environment = install_fakes(monkeypatch, samples)
+    config = parallel_config(tmp_path)
+    async with FetcherDatabase(config.database) as database:
+        for sample in samples[:4]:
+            stored = await database.store(sample.commit, sample.date, {})
+            assert stored
+
+    await run(config)
+
+    assert environment.checkouts == [
+        (tmp_path / "pool" / "worker-0", "commit-4"),
+        (tmp_path / "pool" / "worker-1", "commit-5"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_shard_boundary_counts_from_a_stored_neighbour(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    samples = samples_named("a", "b", "c", "d")
+    environment = install_fakes(monkeypatch, samples)
+    config = parallel_config(tmp_path)
+    async with FetcherDatabase(config.database) as database:
+        stored = await database.store("a", samples[0].date, {"fetchurl": 5})
+        assert stored
+
+    await run(config)
+
+    assert environment.updates == [("a", "b"), ("c", "d")]
+    assert environment.full_scans == ["c"]

@@ -4,7 +4,7 @@ import itertools
 import sys
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter
 
@@ -60,12 +60,6 @@ class PendingSample:
     global_index: int
     sample: SampledCommit
     newer_sample: SampledCommit | None
-
-
-@dataclass(frozen=True, slots=True)
-class Shard:
-    index: int
-    commits: list[tuple[int, SampledCommit]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,35 +184,15 @@ def timed(stage: str, commit: str) -> Generator[None]:
         )
 
 
-def build_shards(
-    indexed_commits: Sequence[tuple[int, SampledCommit]],
-    workers: int,
-) -> list[Shard]:
-    """Split the sampled history into contiguous, index-preserving shards.
-
-    Boundaries are computed over the full commit list so that the global
-    index of every sample survives, keeping the scheduled full-scan cadence
-    anchored to the history rather than to a shard.
-    """
-    total = len(indexed_commits)
-    bounds = [total * index // workers for index in range(workers + 1)]
-    return [
-        Shard(index=index, commits=list(indexed_commits[start:end]))
-        for index, (start, end) in enumerate(itertools.pairwise(bounds))
-    ]
-
-
 def build_pending(
     indexed_commits: Sequence[tuple[int, SampledCommit]],
     completed: set[str],
 ) -> list[PendingSample]:
     """Select the samples still to process, with their newer neighbour.
 
-    The neighbour is the preceding sample of this range, completed or not, so
-    a resumed run still counts incrementally from an adjacent stored row. The
-    very first sample of a range has no neighbour, because reading across a
-    shard boundary would make full-scan-versus-incremental depend on
-    scheduling order.
+    The neighbour is the immediately newer sample, completed or not, so a
+    resumed run still counts incrementally from an adjacent stored row. Only
+    the newest sample of the whole history has none.
     """
     return [
         PendingSample(
@@ -229,6 +203,43 @@ def build_pending(
         for position, (global_index, sample) in enumerate(indexed_commits)
         if sample.commit not in completed
     ]
+
+
+def _shard_boundary(item: PendingSample, completed: set[str]) -> PendingSample:
+    """Drop a neighbour that another shard is about to process.
+
+    A stored neighbour is safe to read: its row exists before the run starts
+    and no shard ever rewrites it. A neighbour that is itself pending belongs
+    to the previous shard, so reusing it would make
+    full-scan-versus-incremental depend on which shard got there first.
+    """
+    if item.newer_sample is None or item.newer_sample.commit in completed:
+        return item
+    return replace(item, newer_sample=None)
+
+
+def split_pending(
+    pending: Sequence[PendingSample],
+    workers: int,
+    completed: set[str],
+) -> list[ActiveShard]:
+    """Split the pending samples into contiguous, evenly sized shards.
+
+    Splitting the pending samples rather than the whole history is what keeps
+    every worker busy on a resumed run, where most of the history is already
+    stored. The cost is that boundaries move between runs, so a different
+    sample forfeits its neighbour each time; correctness does not depend on
+    them, because stored rows are keyed by commit.
+    """
+    total = len(pending)
+    bounds = [total * index // workers for index in range(workers + 1)]
+    shards: list[ActiveShard] = []
+    for index, (start, end) in enumerate(itertools.pairwise(bounds)):
+        items = list(pending[start:end])
+        if items:
+            items[0] = _shard_boundary(items[0], completed)
+        shards.append(ActiveShard(index=index, pending=items))
+    return shards
 
 
 async def run_shard(
@@ -391,15 +402,12 @@ async def run_parallel(config: Config) -> None:
         async with FetcherDatabase(config.database) as database:
             completed = await database.completed_commits()
             logger.debug("Skipping completed commit hashes: {}", sorted(completed))
-            indexed_commits = list(enumerate(commits))
+            pending = build_pending(list(enumerate(commits)), completed)
             active_shards = [
-                ActiveShard(
-                    index=shard.index,
-                    pending=build_pending(shard.commits, completed),
-                )
-                for shard in build_shards(indexed_commits, config.workers)
+                shard
+                for shard in split_pending(pending, config.workers, completed)
+                if shard.pending
             ]
-            active_shards = [shard for shard in active_shards if shard.pending]
             total_pending = sum(len(shard.pending) for shard in active_shards)
             logger.info(
                 "Found {} sampled commits; {} remain across {} of {} shards",

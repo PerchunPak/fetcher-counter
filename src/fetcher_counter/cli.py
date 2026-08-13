@@ -397,7 +397,8 @@ async def run_shard(
             _ = await database.store(sample.commit, sample.date, counts)
         finally:
             progress.advance(tasks.shard)
-            progress.advance(tasks.total)
+            if tasks.total != tasks.shard:
+                progress.advance(tasks.total)
 
 
 async def _run_labelled_shard(
@@ -444,17 +445,14 @@ async def run_single_worker(config: Config) -> None:
             len(pending),
         )
         with Progress(*progress_columns(), console=console) as progress:
-            tasks = ProgressTasks(
-                total=progress.add_task("Total", total=len(pending)),
-                shard=progress.add_task("Shard 0", total=len(pending)),
-            )
+            task = progress.add_task("Total", total=len(pending))
             await run_shard(
                 config,
                 worktree=config.nixpkgs,
                 pending=pending,
                 database=database,
                 progress=progress,
-                tasks=tasks,
+                tasks=ProgressTasks(total=task, shard=task),
             )
 
 

@@ -1117,7 +1117,7 @@ async def test_single_worker_reverse_processes_oldest_to_newest(
 
 
 @pytest.mark.asyncio
-async def test_single_worker_shows_total_and_shard_progress(
+async def test_single_worker_shows_only_total_progress(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1128,12 +1128,12 @@ async def test_single_worker_shows_total_and_shard_progress(
 
     assert len(progress_instances) == 1
     progress = progress_instances[0]
-    assert progress.tasks == [(0, "Total", 2), (1, "Shard 0", 2)]
-    assert progress.advanced == [1, 0, 1, 0]
+    assert progress.tasks == [(0, "Total", 2)]
+    assert progress.advanced == [0, 0]
 
 
 @pytest.mark.asyncio
-async def test_skipped_evaluation_advances_both_progress_rows(
+async def test_skipped_evaluation_advances_single_worker_progress(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1154,7 +1154,7 @@ async def test_skipped_evaluation_advances_both_progress_rows(
     await run(parallel_config(tmp_path, workers=1, worktrees_dir=None))
 
     progress = progress_instances[0]
-    assert progress.advanced == [1, 0]
+    assert progress.advanced == [0]
     connection = sqlite3.connect(tmp_path / "fetchers.sqlite3")
     row = connection.execute(
         'SELECT "is_skipped" FROM "fetchers" WHERE "commit" = "failed"'
@@ -1202,7 +1202,7 @@ async def test_failed_sample_advances_progress_before_propagating(
     with pytest.raises(RuntimeError, match="checkout failed"):
         await run(parallel_config(tmp_path, workers=1, worktrees_dir=None))
 
-    assert progress_instances[0].advanced == [1, 0]
+    assert progress_instances[0].advanced == [0]
 
 
 @pytest.mark.asyncio

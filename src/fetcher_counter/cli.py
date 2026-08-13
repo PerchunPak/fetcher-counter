@@ -62,6 +62,7 @@ class Config:
     full_scan_interval: int = DEFAULT_FULL_SCAN_INTERVAL
     log_level: str = DEFAULT_LOG_LEVEL
     workers: int = DEFAULT_WORKERS
+    reverse: bool = False
     # `None` means "derive the pool from the resolved Nixpkgs path", which
     # keeps an omitted `--worktrees-dir` distinguishable from one passed
     # explicitly.
@@ -72,7 +73,7 @@ class Config:
 class PendingSample:
     global_index: int
     sample: SampledCommit
-    newer_sample: SampledCommit | None
+    previous_sample: SampledCommit | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +159,11 @@ def parse_args(arguments: list[str] | None = None) -> Config:
         help="concurrent history shards (default: 1)",
     )
     _ = parser.add_argument(
+        "--reverse",
+        action="store_true",
+        help="traverse sampled commits from oldest to newest",
+    )
+    _ = parser.add_argument(
         "--worktrees-dir",
         type=Path,
         default=None,
@@ -179,6 +185,7 @@ def parse_args(arguments: list[str] | None = None) -> Config:
         full_scan_interval=namespace.full_scan_interval,
         log_level=namespace.log_level,
         workers=namespace.workers,
+        reverse=namespace.reverse,
         worktrees_dir=namespace.worktrees_dir,
     )
 
@@ -238,21 +245,34 @@ def timed(stage: str, commit: str) -> Generator[None]:
         )
 
 
+def indexed_for_traversal(
+    commits: Sequence[SampledCommit],
+    *,
+    reverse: bool,
+) -> list[tuple[int, SampledCommit]]:
+    indexed_commits = list(enumerate(commits))
+    if reverse:
+        indexed_commits.reverse()
+    return indexed_commits
+
+
 def build_pending(
     indexed_commits: Sequence[tuple[int, SampledCommit]],
     completed: set[str],
 ) -> list[PendingSample]:
-    """Select the samples still to process, with their newer neighbour.
+    """Select the samples still to process, with their previous neighbour.
 
-    The neighbour is the immediately newer sample, completed or not, so a
-    resumed run still counts incrementally from an adjacent stored row. Only
-    the newest sample of the whole history has none.
+    The neighbour immediately precedes the sample in traversal order, completed
+    or not, so a resumed run still counts incrementally from an adjacent stored
+    row. Only the first sample in the traversal has none.
     """
     return [
         PendingSample(
             global_index=global_index,
             sample=sample,
-            newer_sample=(indexed_commits[position - 1][1] if position else None),
+            previous_sample=(
+                indexed_commits[position - 1][1] if position else None
+            ),
         )
         for position, (global_index, sample) in enumerate(indexed_commits)
         if sample.commit not in completed
@@ -267,9 +287,9 @@ def _shard_boundary(item: PendingSample, completed: set[str]) -> PendingSample:
     to the previous shard, so reusing it would make
     full-scan-versus-incremental depend on which shard got there first.
     """
-    if item.newer_sample is None or item.newer_sample.commit in completed:
+    if item.previous_sample is None or item.previous_sample.commit in completed:
         return item
-    return replace(item, newer_sample=None)
+    return replace(item, previous_sample=None)
 
 
 def split_pending(
@@ -338,19 +358,19 @@ async def run_shard(
                     sample.commit,
                     item.global_index + 1,
                 )
-            if item.newer_sample is not None and not scheduled_full_scan:
-                newer_counts = await database.counts_for_commit(
-                    item.newer_sample.commit,
+            if item.previous_sample is not None and not scheduled_full_scan:
+                previous_counts = await database.counts_for_commit(
+                    item.previous_sample.commit,
                     fetchers,
                 )
-                if newer_counts is not None:
+                if previous_counts is not None:
                     try:
                         with timed("Incremental count", sample.commit):
                             counts = await update_fetcher_counts(
                                 worktree,
-                                item.newer_sample.commit,
+                                item.previous_sample.commit,
                                 sample.commit,
-                                newer_counts,
+                                previous_counts,
                             )
                     except IncrementalCountError as error:
                         logger.warning(
@@ -361,7 +381,7 @@ async def run_shard(
                     else:
                         logger.debug(
                             "Used counts from adjacent commit {} for {}",
-                            item.newer_sample.commit,
+                            item.previous_sample.commit,
                             sample.commit,
                         )
 
@@ -414,7 +434,9 @@ async def run_single_worker(config: Config) -> None:
     commits = await sampled_commits(config.nixpkgs, interval=config.interval)
     async with FetcherDatabase(config.database) as database:
         completed = await database.completed_commits()
-        pending = build_pending(list(enumerate(commits)), completed)
+        pending = build_pending(
+            indexed_for_traversal(commits, reverse=config.reverse), completed
+        )
         logger.debug("Skipping completed commit hashes: {}", sorted(completed))
         logger.info(
             "Found {} sampled commits; {} remain",
@@ -473,7 +495,9 @@ async def run_parallel(config: Config) -> None:
         async with FetcherDatabase(config.database) as database:
             completed = await database.completed_commits()
             logger.debug("Skipping completed commit hashes: {}", sorted(completed))
-            pending = build_pending(list(enumerate(commits)), completed)
+            pending = build_pending(
+                indexed_for_traversal(commits, reverse=config.reverse), completed
+            )
             active_shards = [
                 shard
                 for shard in split_pending(pending, config.workers, completed)
@@ -558,6 +582,7 @@ def main() -> None:
         full_scan_interval=parsed.full_scan_interval,
         log_level=parsed.log_level,
         workers=parsed.workers,
+        reverse=parsed.reverse,
         worktrees_dir=(
             parsed.worktrees_dir.resolve()
             if parsed.worktrees_dir is not None

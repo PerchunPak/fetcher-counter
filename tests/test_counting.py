@@ -295,6 +295,20 @@ async def test_update_fetcher_counts_handles_added_and_deleted_files(
         "fetchzip": 0,
     }
 
+    reverse_counts = await update_fetcher_counts(
+        tmp_path,
+        older,
+        newer,
+        counts,
+    )
+
+    assert reverse_counts == {
+        "fetch": 0,
+        "fetch-scm": 0,
+        "fetchurl": 2,
+        "fetchzip": 1,
+    }
+
 
 @pytest.mark.asyncio
 async def test_update_fetcher_counts_preserves_counts_without_changes(

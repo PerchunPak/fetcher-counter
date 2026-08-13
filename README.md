@@ -28,6 +28,7 @@ uv run fetcher-counter \
   --interval 50 \
   --full-scan-interval 25 \
   --workers 4 \
+  --reverse \
   --worktrees-dir /path/to/worktree-pool \
   --log-level DEBUG
 ```
@@ -91,9 +92,11 @@ lock protects one pool, not a repository or a database.
 
 The program obtains the saved history tip with `--first-parent`. Sampling is
 anchored at the oldest commit using indices `0, 50, 100, ...`, but the selected
-commits are traversed from newest to oldest. Pulling new Nixpkgs commits therefore
-does not shift or reset previously selected historical commits; new samples are
-added only when the oldest-anchored interval reaches them. The initial history
+commits are traversed from newest to oldest by default. `--reverse` traverses the
+same selected commits from oldest to newest without changing their stable sample
+indices. Pulling new Nixpkgs commits therefore does not shift or reset previously
+selected historical commits; new samples are added only when the oldest-anchored
+interval reaches them. The initial history
 tip is saved as
 `refs/fetcher-counter/history-tip` inside the Nixpkgs repository, so a restart
 continues to see the full history even though `HEAD` was left at a historical
@@ -114,26 +117,26 @@ Each matching source line is processed once, and each fetcher is counted at most
 once per line even if it appears repeatedly. Each count is therefore the number
 of matching lines across Nix files.
 
-Because samples are traversed newest to oldest, later revisions normally reuse
-the stored counts from the immediately newer sample. A zero-context Git diff of
-Nix files subtracts matches on lines removed from the newer tree and adds matches
-on lines introduced in the older tree. By default, every 25th sampled iteration
+Each revision normally reuses the stored counts from the adjacent sample that
+precedes it in traversal order: newer under the default order and older with
+`--reverse`. A zero-context Git diff transforms those counts from the preceding
+tree into counts for the current tree. By default, every 25th sampled position
 forces a full ripgrep scan as a periodic correctness checkpoint; this cadence can
 be changed with `--full-scan-interval`. The program also falls back to a full
 scan when the adjacent row is missing or skipped, the active fetcher set
-changed, the sample has no newer neighbor, or the diff cannot produce
+changed, the sample is first in traversal order, or the diff cannot produce
 trustworthy non-negative counts. This lets an interrupted run resume
 incrementally from its adjacent completed row while keeping the safety checkpoints
 anchored to stable positions in the sampled history.
 
 Every sample keeps the history position that decides its full-scan checkpoint,
-no matter how many workers run. A pending sample reuses its immediately newer
-neighbor, completed or not, exactly as a sequential run does. The one exception
-is the first sample of a shard whose neighbor is itself pending in another
-shard: that sample uses a full scan, because reading a row another shard is
-about to write would make the choice depend on scheduling order. A boundary
-sample whose neighbor was already stored by an earlier run still counts
-incrementally.
+regardless of traversal direction or worker count. A pending sample reuses its
+immediately preceding neighbor in traversal order, completed or not, exactly as
+a sequential run does. The one exception is the first sample of a shard whose
+neighbor is itself pending in another shard: that sample uses a full scan,
+because reading a row another shard is about to write would make the choice
+depend on scheduling order. A boundary sample whose neighbor was already stored
+by an earlier run still counts incrementally.
 
 ## Database
 

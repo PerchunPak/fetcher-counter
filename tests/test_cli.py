@@ -32,6 +32,7 @@ def test_parse_args_uses_project_defaults() -> None:
     assert config.full_scan_interval == 25
     assert config.log_level == "INFO"
     assert config.workers == 1
+    assert config.reverse is False
     assert config.worktrees_dir is None
 
 
@@ -39,6 +40,12 @@ def test_parse_args_accepts_full_scan_interval() -> None:
     config = parse_args(["--full-scan-interval", "7"])
 
     assert config.full_scan_interval == 7
+
+
+def test_parse_args_accepts_reverse() -> None:
+    config = parse_args(["--reverse"])
+
+    assert config.reverse is True
 
 
 def test_parse_args_rejects_nonpositive_full_scan_interval() -> None:
@@ -630,6 +637,79 @@ async def test_run_resumes_from_adjacent_completed_row(
 
 
 @pytest.mark.asyncio
+async def test_reverse_run_resumes_from_adjacent_completed_row(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    samples = [
+        SampledCommit("newest", "2026-01-03T00:00:00Z"),
+        SampledCommit("middle", "2026-01-02T00:00:00Z"),
+        SampledCommit("oldest", "2026-01-01T00:00:00Z"),
+    ]
+    database_path = tmp_path / "fetchers.sqlite3"
+    async with FetcherDatabase(database_path) as database:
+        assert await database.store("oldest", samples[2].date, {"fetchurl": 3})
+
+    async def fake_samples(
+        _repository: Path,
+        *,
+        interval: int,
+    ) -> list[SampledCommit]:
+        assert interval == 50
+        return samples
+
+    async def fake_checkout(_repository: Path, commit: str) -> None:
+        assert commit in {"middle", "newest"}
+
+    async def fake_discovery(
+        _nixpkgs: Path,
+        _expression: Path,
+        *,
+        commit: str,
+    ) -> list[str]:
+        assert commit in {"middle", "newest"}
+        return ["fetchurl"]
+
+    async def fail_full_scan(
+        _repository: Path,
+        _commit: str,
+        _fetchers: list[str],
+    ) -> dict[str, int]:
+        pytest.fail("an adjacent completed row should avoid a full scan")
+
+    updates: list[tuple[str, str, dict[str, int]]] = []
+
+    async def fake_update(
+        _repository: Path,
+        base_commit: str,
+        target_commit: str,
+        base_counts: dict[str, int],
+    ) -> dict[str, int]:
+        updates.append((base_commit, target_commit, base_counts))
+        return {"fetchurl": base_counts["fetchurl"] + 1}
+
+    monkeypatch.setattr(cli, "sampled_commits", fake_samples)
+    monkeypatch.setattr(cli, "checkout", fake_checkout)
+    monkeypatch.setattr(cli, "discover_fetchers", fake_discovery)
+    monkeypatch.setattr(cli, "count_fetchers", fail_full_scan)
+    monkeypatch.setattr(cli, "update_fetcher_counts", fake_update)
+
+    await run(
+        Config(
+            nixpkgs=tmp_path / "nixpkgs",
+            database=database_path,
+            expression=tmp_path / "get-fetchers.nix",
+            reverse=True,
+        )
+    )
+
+    assert updates == [
+        ("oldest", "middle", {"fetchurl": 3}),
+        ("middle", "newest", {"fetchurl": 4}),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_run_falls_back_when_incremental_count_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -709,6 +789,14 @@ def samples_named(*names: str) -> list[SampledCommit]:
 
 def indexed(samples: list[SampledCommit]) -> list[tuple[int, SampledCommit]]:
     return list(enumerate(samples))
+
+
+def test_reverse_traversal_preserves_global_history_indices() -> None:
+    samples = samples_named("newest", "middle", "oldest")
+
+    traversed = cli.indexed_for_traversal(samples, reverse=True)
+
+    assert traversed == [(2, samples[2]), (1, samples[1]), (0, samples[0])]
 
 
 class RecordingProgress:
@@ -961,8 +1049,8 @@ def test_pending_samples_keep_global_indices_and_neighbours() -> None:
     shards = shard_pending(samples, 2)
 
     assert [item.global_index for item in shards[1].pending] == [2, 3]
-    assert shards[0].pending[1].newer_sample == samples[0]
-    assert shards[1].pending[1].newer_sample == samples[2]
+    assert shards[0].pending[1].previous_sample == samples[0]
+    assert shards[1].pending[1].previous_sample == samples[2]
 
 
 def test_a_shard_boundary_reuses_an_already_stored_neighbour() -> None:
@@ -971,7 +1059,7 @@ def test_a_shard_boundary_reuses_an_already_stored_neighbour() -> None:
     shards = shard_pending(samples, 2, {"a", "b"})
 
     assert [item.sample.commit for item in shards[0].pending] == ["c"]
-    assert shards[0].pending[0].newer_sample == samples[1]
+    assert shards[0].pending[0].previous_sample == samples[1]
 
 
 def test_a_shard_boundary_never_uses_another_shard_pending_neighbour() -> None:
@@ -980,8 +1068,8 @@ def test_a_shard_boundary_never_uses_another_shard_pending_neighbour() -> None:
     shards = shard_pending(samples, 2)
 
     assert [item.sample.commit for item in shards[1].pending] == ["c", "d"]
-    assert shards[1].pending[0].newer_sample is None
-    assert shards[0].pending[0].newer_sample is None
+    assert shards[1].pending[0].previous_sample is None
+    assert shards[0].pending[0].previous_sample is None
 
 
 @pytest.mark.asyncio
@@ -1000,6 +1088,32 @@ async def test_single_worker_uses_the_checkout_without_a_pool(
     ]
     assert environment.provisions == 0
     assert not list(tmp_path.glob(".nixpkgs-fetcher-counter-worktrees*"))  # noqa: ASYNC240
+
+
+@pytest.mark.asyncio
+async def test_single_worker_reverse_processes_oldest_to_newest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    environment = install_fakes(
+        monkeypatch, samples_named("newest", "middle", "oldest")
+    )
+    config = parallel_config(
+        tmp_path,
+        workers=1,
+        worktrees_dir=None,
+        reverse=True,
+    )
+
+    await run(config)
+
+    assert environment.checkouts == [
+        (config.nixpkgs, "oldest"),
+        (config.nixpkgs, "middle"),
+        (config.nixpkgs, "newest"),
+    ]
+    assert environment.full_scans == ["oldest"]
+    assert environment.updates == [("oldest", "middle"), ("middle", "newest")]
 
 
 @pytest.mark.asyncio
@@ -1113,6 +1227,27 @@ async def test_parallel_run_processes_every_shard_in_its_own_worktree(
         (tmp_path / "pool" / "worker-1", "d"),
     ]
     assert set(stored_counts(config.database, "fetchurl")) == {"a", "b", "c", "d"}
+
+
+@pytest.mark.asyncio
+async def test_parallel_reverse_shards_oldest_to_newest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    environment = install_fakes(monkeypatch, samples_named("a", "b", "c", "d"))
+    config = parallel_config(tmp_path, reverse=True)
+
+    await run(config)
+
+    assert [
+        (request.index, request.initial_commit) for request in environment.requests
+    ] == [(0, "d"), (1, "b")]
+    assert sorted(environment.checkouts) == [
+        (tmp_path / "pool" / "worker-0", "c"),
+        (tmp_path / "pool" / "worker-0", "d"),
+        (tmp_path / "pool" / "worker-1", "a"),
+        (tmp_path / "pool" / "worker-1", "b"),
+    ]
 
 
 @pytest.mark.asyncio

@@ -163,11 +163,11 @@ def _apply_diff(
 
 async def update_fetcher_counts(
     repository: Path,
-    newer_commit: str,
-    older_commit: str,
-    newer_counts: Mapping[str, int],
+    base_commit: str,
+    target_commit: str,
+    base_counts: Mapping[str, int],
 ) -> dict[str, int]:
-    counts = dict(sorted(newer_counts.items()))
+    counts = dict(sorted(base_counts.items()))
     if not counts:
         return {}
     if any(count < 0 for count in counts.values()):
@@ -176,8 +176,8 @@ async def update_fetcher_counts(
     logger.debug(
         "Updating {} fetcher counts from {} to {} with Git diff",
         len(counts),
-        newer_commit,
-        older_commit,
+        base_commit,
+        target_commit,
     )
     command = (
         "git",
@@ -189,8 +189,8 @@ async def update_fetcher_counts(
         "--no-ext-diff",
         "--no-renames",
         "--text",
-        newer_commit,
-        older_commit,
+        base_commit,
+        target_commit,
         "--",
         "*.nix",
     )
@@ -204,13 +204,13 @@ async def update_fetcher_counts(
         message = stderr.decode(errors="replace").strip()
         logger.debug(
             "Git diff from {} to {} failed with exit code {}: {}",
-            newer_commit,
-            older_commit,
+            base_commit,
+            target_commit,
             process.returncode,
             message,
         )
-        detail = f"failed to update counts from {newer_commit} to " + (
-            f"{older_commit}: {message}"
+        detail = f"failed to update counts from {base_commit} to " + (
+            f"{target_commit}: {message}"
         )
         raise IncrementalCountError(detail)
 
@@ -222,5 +222,5 @@ async def update_fetcher_counts(
             f"incremental counts became negative for {', '.join(negative)}"
         )
 
-    logger.debug("Finished incremental counts at {}: {}", older_commit, counts)
+    logger.debug("Finished incremental counts at {}: {}", target_commit, counts)
     return counts

@@ -1,7 +1,10 @@
 import asyncio
+import gc
 import shutil
 import subprocess
+from collections.abc import Coroutine
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -32,6 +35,37 @@ class Process:
 
     async def wait(self) -> int:
         return self.returncode
+
+
+class StreamingProcess:
+    """A `git log` process that only ends once it is asked to."""
+
+    def __init__(self, *, stdout: bytes = b"", stderr: bytes = b"") -> None:
+        self.stdout: asyncio.StreamReader = asyncio.StreamReader()
+        self.stdout.feed_data(stdout)
+        self.stderr: asyncio.StreamReader = asyncio.StreamReader()
+        self.stderr.feed_data(stderr)
+        self.terminated: int = 0
+        self.killed: int = 0
+        self._exited: asyncio.Event = asyncio.Event()
+
+    async def wait(self) -> int:
+        _ = await self._exited.wait()
+        return 0
+
+    def terminate(self) -> None:
+        self.terminated += 1
+        self._exit()
+
+    def kill(self) -> None:
+        self.killed += 1
+        self._exit()
+
+    def _exit(self) -> None:
+        if not self._exited.is_set():
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self._exited.set()
 
 
 def run_git(repository: Path, *arguments: str) -> str:
@@ -286,3 +320,105 @@ async def test_sampled_commits_reports_streamed_log_failure(
 
     with pytest.raises(GitCommandError, match=r"git log.*log failed"):
         _ = await sampled_commits(tmp_path, interval=2)
+
+
+def record_created_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[asyncio.Task[Any]]:
+    created: list[asyncio.Task[Any]] = []
+    original = asyncio.create_task
+
+    def create_task(
+        coroutine: Coroutine[Any, Any, Any],
+        **options: Any,
+    ) -> asyncio.Task[Any]:
+        task = original(coroutine, **options)
+        created.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", create_task)
+    return created
+
+
+def record_loop_exceptions() -> list[dict[str, Any]]:
+    reported: list[dict[str, Any]] = []
+    asyncio.get_running_loop().set_exception_handler(
+        lambda _loop, context: reported.append(context)
+    )
+    return reported
+
+
+async def assert_tasks_reconciled(
+    created: list[asyncio.Task[Any]],
+    reported: list[dict[str, Any]],
+) -> None:
+    assert created
+    assert all(task.done() for task in created)
+    assert not any(task.cancelled() for task in created)
+    _ = gc.collect()
+    await asyncio.sleep(0)
+    assert reported == []
+
+
+@pytest.mark.asyncio
+async def test_streamed_log_reconciles_tasks_after_parse_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    process = StreamingProcess(stdout=b"missing-separator\n")
+
+    async def fake_tip(_repository: Path) -> str:
+        return "tip"
+
+    async def create_process(
+        *_arguments: object,
+        **_options: object,
+    ) -> StreamingProcess:
+        return process
+
+    monkeypatch.setattr(history, "history_tip", fake_tip)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", create_process)
+    reported = record_loop_exceptions()
+    created = record_created_tasks(monkeypatch)
+
+    with pytest.raises(GitCommandError, match="failed to read git history") as (
+        error
+    ):
+        _ = await sampled_commits(tmp_path, interval=1)
+
+    assert isinstance(error.value.__cause__, ValueError)
+    assert process.terminated == 1
+    assert process.killed == 0
+    await assert_tasks_reconciled(created, reported)
+
+
+@pytest.mark.asyncio
+async def test_streamed_log_reconciles_tasks_after_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    process = StreamingProcess(stdout=b"oldest\x002001\n")
+
+    async def fake_tip(_repository: Path) -> str:
+        return "tip"
+
+    async def create_process(
+        *_arguments: object,
+        **_options: object,
+    ) -> StreamingProcess:
+        return process
+
+    monkeypatch.setattr(history, "history_tip", fake_tip)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", create_process)
+    reported = record_loop_exceptions()
+    sampling = asyncio.create_task(sampled_commits(tmp_path, interval=1))
+    created = record_created_tasks(monkeypatch)
+    await asyncio.sleep(0.01)
+
+    _ = sampling.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await sampling
+
+    assert process.terminated == 1
+    assert process.killed == 0
+    await assert_tasks_reconciled(created, reported)

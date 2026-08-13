@@ -5,6 +5,8 @@ from pathlib import Path
 
 from loguru import logger
 
+from fetcher_counter.processes import communicate_cancellable
+
 
 class GrepError(RuntimeError):
     pass
@@ -90,7 +92,7 @@ async def count_fetchers(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await process.communicate()
+    stdout, stderr = await communicate_cancellable(process)
     message = stderr.decode(errors="replace").strip()
     if process.returncode not in {0, 1} or message:
         logger.debug(
@@ -197,7 +199,7 @@ async def update_fetcher_counts(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await process.communicate()
+    stdout, stderr = await communicate_cancellable(process)
     if process.returncode != 0:
         message = stderr.decode(errors="replace").strip()
         logger.debug(

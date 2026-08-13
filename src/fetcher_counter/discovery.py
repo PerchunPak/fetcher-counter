@@ -5,6 +5,8 @@ from typing import cast
 
 from loguru import logger
 
+from fetcher_counter.processes import communicate_cancellable
+
 
 class FetcherDiscoveryError(RuntimeError):
     pass
@@ -31,7 +33,7 @@ async def discover_fetchers(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await process.communicate()
+    stdout, stderr = await communicate_cancellable(process)
     if process.returncode != 0:
         message = stderr.decode(errors="replace").strip()
         logger.debug(

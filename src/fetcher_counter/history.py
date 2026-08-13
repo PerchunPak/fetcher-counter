@@ -1,8 +1,11 @@
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 
 from loguru import logger
+
+from fetcher_counter.processes import TERMINATE_TIMEOUT, communicate_cancellable
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +46,7 @@ async def _run_git(repository: Path, *arguments: str) -> bytes:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await process.communicate()
+    stdout, stderr = await communicate_cancellable(process)
     if process.returncode != 0:
         message = stderr.decode(errors="replace").strip()
         logger.debug(
@@ -79,6 +82,23 @@ async def history_tip(repository: Path) -> str:
     return head
 
 
+async def _read_samples(
+    stdout: asyncio.StreamReader,
+    *,
+    interval: int,
+) -> tuple[list[SampledCommit], int]:
+    samples: list[SampledCommit] = []
+    commit_count = 0
+    async for raw_line in stdout:
+        if commit_count % interval == 0:
+            commit, date = (
+                raw_line.rstrip(b"\r\n").decode().split("\0", maxsplit=1)
+            )
+            samples.append(SampledCommit(commit=commit, date=date))
+        commit_count += 1
+    return samples, commit_count
+
+
 async def sampled_commits(
     repository: Path,
     *,
@@ -106,20 +126,64 @@ async def sampled_commits(
     )
     assert process.stdout is not None
     assert process.stderr is not None
+    stdout_task = asyncio.create_task(
+        _read_samples(process.stdout, interval=interval)
+    )
     stderr_task = asyncio.create_task(process.stderr.read())
+    wait_task = asyncio.create_task(process.wait())
+    completion = asyncio.gather(stdout_task, stderr_task, wait_task)
+    cleanup_task: asyncio.Task[None] | None = None
 
-    samples: list[SampledCommit] = []
-    commit_count = 0
-    async for raw_line in process.stdout:
-        if commit_count % interval == 0:
-            commit, date = (
-                raw_line.rstrip(b"\r\n").decode().split("\0", maxsplit=1)
+    async def reconcile_tasks() -> None:
+        """Wait out every owned task, whatever already failed.
+
+        `completion` fails as soon as one of its children does, so awaiting it
+        again would return immediately instead of waiting for the other two.
+        A separate gather over the same tasks is what actually reconciles
+        them; `completion` itself is consumed afterwards so asyncio does not
+        report its exception as never retrieved.
+        """
+        results = await asyncio.gather(
+            stdout_task,
+            stderr_task,
+            wait_task,
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.debug("Git log task ended during cleanup: {}", result)
+        if completion.done():
+            with contextlib.suppress(BaseException):
+                _ = completion.result()
+
+    async def stop_git_log_process() -> None:
+        nonlocal cleanup_task
+        if cleanup_task is None:
+            cleanup_task = asyncio.create_task(reconcile_tasks())
+        with contextlib.suppress(ProcessLookupError):
+            process.terminate()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(cleanup_task),
+                timeout=TERMINATE_TIMEOUT,
             )
-            samples.append(SampledCommit(commit=commit, date=date))
-        commit_count += 1
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            await asyncio.shield(cleanup_task)
+        except Exception as error:  # noqa: BLE001
+            logger.warning("Git log cleanup failed: {}", error)
 
-    returncode = await process.wait()
-    stderr = await stderr_task
+    try:
+        (samples, commit_count), stderr, returncode = await asyncio.shield(
+            completion
+        )
+    except asyncio.CancelledError:
+        await stop_git_log_process()
+        raise
+    except Exception as error:
+        await stop_git_log_process()
+        raise GitCommandError(f"failed to read git history: {error}") from error
     if returncode != 0:
         message = stderr.decode(errors="replace").strip()
         logger.debug(

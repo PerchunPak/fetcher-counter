@@ -29,6 +29,7 @@ uv run fetcher-counter \
   --full-scan-interval 25 \
   --workers 4 \
   --reverse \
+  --no-first-parent \
   --worktrees-dir /path/to/worktree-pool \
   --log-level DEBUG
 ```
@@ -90,14 +91,17 @@ lock protects one pool, not a repository or a database.
 
 ## History and counting semantics
 
-The program obtains the saved history tip with `--first-parent`. Sampling is
-anchored at the oldest commit using indices `0, 50, 100, ...`, but the selected
-commits are traversed from newest to oldest by default. `--reverse` traverses the
-same selected commits from oldest to newest without changing their stable sample
-indices. Pulling new Nixpkgs commits therefore does not shift or reset previously
-selected historical commits; new samples are added only when the oldest-anchored
-interval reaches them. The initial history
-tip is saved as
+The program obtains the saved history tip and follows its first-parent history
+by default. `--no-first-parent` instead samples all commits reachable from that
+tip, including commits on merged branches. Sampling is anchored at the oldest
+commit using indices `0, 50, 100, ...`, but the selected commits are traversed
+from newest to oldest by default. `--reverse` traverses the same selected commits
+from oldest to newest without changing their stable sample indices. Pulling new
+Nixpkgs commits therefore does not shift or reset previously selected historical
+commits; new samples are added only when the oldest-anchored interval reaches
+them. With `--no-first-parent`, a later merge can make older branch commits newly
+reachable and therefore shift the sampled positions. The initial history tip is
+saved as
 `refs/fetcher-counter/history-tip` inside the Nixpkgs repository, so a restart
 continues to see the full history even though `HEAD` was left at a historical
 revision. Checking out a newer descendant before another run advances that

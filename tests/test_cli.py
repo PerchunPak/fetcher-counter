@@ -33,6 +33,7 @@ def test_parse_args_uses_project_defaults() -> None:
     assert config.log_level == "INFO"
     assert config.workers == 1
     assert config.reverse is False
+    assert config.first_parent is True
     assert config.worktrees_dir is None
 
 
@@ -46,6 +47,12 @@ def test_parse_args_accepts_reverse() -> None:
     config = parse_args(["--reverse"])
 
     assert config.reverse is True
+
+
+def test_parse_args_accepts_no_first_parent() -> None:
+    config = parse_args(["--no-first-parent"])
+
+    assert config.first_parent is False
 
 
 def test_parse_args_rejects_nonpositive_full_scan_interval() -> None:
@@ -214,7 +221,9 @@ async def test_run_skips_completed_commits_and_persists_active_fetchers(
         _repository: Path,
         *,
         interval: int,
+        first_parent: bool,
     ) -> list[SampledCommit]:
+        assert first_parent is False
         assert interval == 50
         return samples
 
@@ -249,6 +258,7 @@ async def test_run_skips_completed_commits_and_persists_active_fetchers(
                 nixpkgs=tmp_path / "nixpkgs",
                 database=database_path,
                 expression=tmp_path / "get-fetchers.nix",
+                first_parent=False,
             )
         )
     finally:
@@ -294,7 +304,9 @@ async def test_run_persists_failed_evaluation_and_continues(
         _repository: Path,
         *,
         interval: int,
+        first_parent: bool,
     ) -> list[SampledCommit]:
+        assert first_parent is True
         assert interval == 50
         return samples
 
@@ -360,7 +372,9 @@ async def test_run_uses_full_baseline_then_adjacent_incremental_counts(
         _repository: Path,
         *,
         interval: int,
+        first_parent: bool,
     ) -> list[SampledCommit]:
+        assert first_parent is True
         assert interval == 50
         return samples
 
@@ -438,7 +452,9 @@ async def test_run_forces_full_scan_at_configured_interval(
         _repository: Path,
         *,
         interval: int,
+        first_parent: bool,
     ) -> list[SampledCommit]:
+        assert first_parent is True
         assert interval == 50
         return samples
 
@@ -515,7 +531,9 @@ async def test_run_uses_history_position_for_scheduled_full_scan_after_resume(
         _repository: Path,
         *,
         interval: int,
+        first_parent: bool,
     ) -> list[SampledCommit]:
+        assert first_parent is True
         assert interval == 50
         return samples
 
@@ -581,7 +599,9 @@ async def test_run_resumes_from_adjacent_completed_row(
         _repository: Path,
         *,
         interval: int,
+        first_parent: bool,
     ) -> list[SampledCommit]:
+        assert first_parent is True
         assert interval == 50
         return samples
 
@@ -654,7 +674,9 @@ async def test_reverse_run_resumes_from_adjacent_completed_row(
         _repository: Path,
         *,
         interval: int,
+        first_parent: bool,
     ) -> list[SampledCommit]:
+        assert first_parent is True
         assert interval == 50
         return samples
 
@@ -726,7 +748,9 @@ async def test_run_falls_back_when_incremental_count_fails(
         _repository: Path,
         *,
         interval: int,
+        first_parent: bool,
     ) -> list[SampledCommit]:
+        assert first_parent is True
         assert interval == 50
         return samples
 
@@ -861,7 +885,9 @@ def install_fakes(
         _repository: Path,
         *,
         interval: int,
+        first_parent: bool,
     ) -> list[SampledCommit]:
+        assert first_parent is True
         assert interval == cli.DEFAULT_INTERVAL
         environment.sampled += 1
         if on_sample is not None:

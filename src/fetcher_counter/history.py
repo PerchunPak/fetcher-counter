@@ -131,6 +131,7 @@ async def sampled_commits(
     repository: Path,
     *,
     interval: int = 50,
+    first_parent: bool = True,
 ) -> list[SampledCommit]:
     if interval < 1:
         raise ValueError("interval must be positive")
@@ -138,7 +139,7 @@ async def sampled_commits(
     tip = await history_tip(repository)
     arguments = (
         "log",
-        "--first-parent",
+        *(("--first-parent",) if first_parent else ()),
         "--reverse",
         "--format=%H%x00%cI",
         tip,

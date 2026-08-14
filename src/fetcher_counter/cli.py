@@ -63,6 +63,7 @@ class Config:
     log_level: str = DEFAULT_LOG_LEVEL
     workers: int = DEFAULT_WORKERS
     reverse: bool = False
+    first_parent: bool = True
     # `None` means "derive the pool from the resolved Nixpkgs path", which
     # keeps an omitted `--worktrees-dir` distinguishable from one passed
     # explicitly.
@@ -144,7 +145,7 @@ def parse_args(arguments: list[str] | None = None) -> Config:
         "--interval",
         type=int,
         default=DEFAULT_INTERVAL,
-        help="first-parent commit sampling interval (default: 50)",
+        help="commit sampling interval (default: 50)",
     )
     _ = parser.add_argument(
         "--full-scan-interval",
@@ -162,6 +163,12 @@ def parse_args(arguments: list[str] | None = None) -> Config:
         "--reverse",
         action="store_true",
         help="traverse sampled commits from oldest to newest",
+    )
+    _ = parser.add_argument(
+        "--no-first-parent",
+        dest="first_parent",
+        action="store_false",
+        help="sample all commits reachable from the history tip",
     )
     _ = parser.add_argument(
         "--worktrees-dir",
@@ -186,6 +193,7 @@ def parse_args(arguments: list[str] | None = None) -> Config:
         log_level=namespace.log_level,
         workers=namespace.workers,
         reverse=namespace.reverse,
+        first_parent=namespace.first_parent,
         worktrees_dir=namespace.worktrees_dir,
     )
 
@@ -432,7 +440,11 @@ async def run_single_worker(config: Config) -> None:
     No worktree pool is created or locked, so the documented behaviour of
     mutating the supplied checkout in place stays intact.
     """
-    commits = await sampled_commits(config.nixpkgs, interval=config.interval)
+    commits = await sampled_commits(
+        config.nixpkgs,
+        interval=config.interval,
+        first_parent=config.first_parent,
+    )
     async with FetcherDatabase(config.database) as database:
         completed = await database.completed_commits()
         pending = build_pending(
@@ -489,7 +501,11 @@ async def run_parallel(config: Config) -> None:
         worktrees_dir = default_worktrees_dir(config.nixpkgs.resolve())
 
     with worktree_pool_lock(worktrees_dir):
-        commits = await sampled_commits(config.nixpkgs, interval=config.interval)
+        commits = await sampled_commits(
+            config.nixpkgs,
+            interval=config.interval,
+            first_parent=config.first_parent,
+        )
         async with FetcherDatabase(config.database) as database:
             completed = await database.completed_commits()
             logger.debug("Skipping completed commit hashes: {}", sorted(completed))
@@ -581,6 +597,7 @@ def main() -> None:
         log_level=parsed.log_level,
         workers=parsed.workers,
         reverse=parsed.reverse,
+        first_parent=parsed.first_parent,
         worktrees_dir=(
             parsed.worktrees_dir.resolve()
             if parsed.worktrees_dir is not None

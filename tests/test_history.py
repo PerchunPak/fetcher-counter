@@ -209,10 +209,16 @@ async def test_checkout_does_not_retry_other_git_failures(
     assert attempts == 1
 
 
+@pytest.mark.parametrize(
+    ("first_parent", "history_arguments"),
+    [(True, ("--first-parent",)), (False, ())],
+)
 @pytest.mark.asyncio
 async def test_sampled_commits_streams_oldest_first_log(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    first_parent: bool,
+    history_arguments: tuple[str, ...],
 ) -> None:
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
@@ -232,7 +238,11 @@ async def test_sampled_commits_streams_oldest_first_log(
     monkeypatch.setattr(history, "history_tip", fake_tip)
     monkeypatch.setattr("asyncio.create_subprocess_exec", create_process)
 
-    samples = await sampled_commits(tmp_path, interval=2)
+    samples = await sampled_commits(
+        tmp_path,
+        interval=2,
+        first_parent=first_parent,
+    )
 
     assert samples == [
         history.SampledCommit("newest", "2005"),
@@ -246,7 +256,7 @@ async def test_sampled_commits_streams_oldest_first_log(
         "-C",
         str(tmp_path),
         "log",
-        "--first-parent",
+        *history_arguments,
         "--reverse",
         "--format=%H%x00%cI",
         "tip",

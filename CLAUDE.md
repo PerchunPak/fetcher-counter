@@ -10,10 +10,13 @@ CLI is `fetcher-counter`, implemented in `src/fetcher_counter/`.
 
 - DO NOT SPAWN AGENTS. DO NOT SPAWN AGENTS. DO NOT SPAWN AGENTS.
 - Work directly on `main`; do not create feature branches.
-- Do not create temporary checkouts or Git worktrees.
+- Do not create development checkouts or Git worktrees for this repository.
+  Runtime-managed Nixpkgs worker worktrees are part of the application and must
+  not be cleaned, reset, or deleted.
 - Make logical changes as separate commits.
-- `./nixpkgs` is intentionally mutated by detached historical checkouts. Do not
-  restore its original revision after a run or failure.
+- With the default single-worker mode, `./nixpkgs` is intentionally mutated by
+  detached historical checkouts. Do not restore its original revision after a
+  run or failure.
 - Never include the resulting `nixpkgs` Gitlink/working-tree modification in an
   implementation commit unless explicitly requested.
 - Prefer to use `pytest -q` instead of `pytest`

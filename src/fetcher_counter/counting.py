@@ -5,7 +5,10 @@ from pathlib import Path
 
 from loguru import logger
 
-from fetcher_counter.processes import communicate_cancellable
+from fetcher_counter.processes import (
+    communicate_cancellable,
+    create_subprocess_exec,
+)
 
 
 class GrepError(RuntimeError):
@@ -86,7 +89,7 @@ async def count_fetchers(
         len(unique_fetchers),
         commit,
     )
-    process = await asyncio.create_subprocess_exec(
+    process = await create_subprocess_exec(
         *command,
         cwd=repository,
         stdout=asyncio.subprocess.PIPE,
@@ -194,7 +197,7 @@ async def update_fetcher_counts(
         "--",
         "*.nix",
     )
-    process = await asyncio.create_subprocess_exec(
+    process = await create_subprocess_exec(
         *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

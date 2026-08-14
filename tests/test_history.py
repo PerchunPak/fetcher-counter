@@ -253,6 +253,7 @@ async def test_sampled_commits_streams_oldest_first_log(
     )
     assert options["stdout"] == asyncio.subprocess.PIPE
     assert options["stderr"] == asyncio.subprocess.PIPE
+    assert options["start_new_session"] is True
 
 
 @pytest.mark.asyncio
@@ -370,9 +371,16 @@ async def test_streamed_log_reconciles_tasks_after_cancellation(
     await asyncio.sleep(0.01)
 
     _ = sampling.cancel()
+    await asyncio.sleep(0)
+
+    assert not sampling.done()
+    assert process.terminated == 0
+    assert process.killed == 0
+
+    process._exit()
     with pytest.raises(asyncio.CancelledError):
         _ = await sampling
 
-    assert process.terminated == 1
+    assert process.terminated == 0
     assert process.killed == 0
     await assert_tasks_reconciled(created, reported)

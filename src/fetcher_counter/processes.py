@@ -1,42 +1,60 @@
 import asyncio
-import contextlib
+from typing import Any
 
 from loguru import logger
 
 TERMINATE_TIMEOUT = 5.0
 
 
+async def create_subprocess_exec(
+    program: str,
+    *arguments: str,
+    **options: Any,
+) -> asyncio.subprocess.Process:
+    """Start a command outside the terminal's foreground process group.
+
+    If cancellation arrives while the child is being created, wait for that
+    child and drain it before propagating cancellation. Otherwise the caller
+    could lose the only handle to a command that has already started.
+    """
+    creation = asyncio.create_task(
+        asyncio.create_subprocess_exec(
+            program,
+            *arguments,
+            start_new_session=True,
+            **options,
+        )
+    )
+    try:
+        return await asyncio.shield(creation)
+    except asyncio.CancelledError:
+        try:
+            process = await asyncio.shield(creation)
+            _ = await communicate_cancellable(process)
+        except Exception as error:  # noqa: BLE001
+            logger.warning(
+                "Subprocess startup cleanup failed during cancellation: {}",
+                error,
+            )
+        raise
+
+
 async def communicate_cancellable(
     process: asyncio.subprocess.Process,
-    *,
-    terminate_timeout: float = TERMINATE_TIMEOUT,
 ) -> tuple[bytes, bytes]:
-    """Communicate with `process`, terminating it when the caller is cancelled.
+    """Communicate with `process`, waiting it out when the caller is cancelled.
 
-    The piped output keeps being drained while the child is asked to exit: a
-    child blocked on a full pipe buffer would otherwise never terminate, so
-    abandoning the original `communicate()` call and only awaiting the process
-    could hang forever. Only the direct child is signalled; processes it
-    spawned itself are not.
+    Commands run in their own sessions, so terminal Ctrl-C cancels the caller
+    without interrupting the child. The original `communicate()` call keeps
+    draining its pipes until the command exits, after which cancellation is
+    propagated and no subsequent command can start.
     """
     communication = asyncio.create_task(process.communicate())
     try:
         return await asyncio.shield(communication)
     except asyncio.CancelledError:
-        with contextlib.suppress(ProcessLookupError):
-            process.terminate()
         try:
-            _ = await asyncio.wait_for(
-                asyncio.shield(communication),
-                timeout=terminate_timeout,
-            )
-        except TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
-            try:
-                _ = await asyncio.shield(communication)
-            except Exception as error:  # noqa: BLE001
-                logger.warning("Failed to drain killed subprocess: {}", error)
+            _ = await asyncio.shield(communication)
         except Exception as error:  # noqa: BLE001
             logger.warning(
                 "Subprocess cleanup failed during cancellation: {}",

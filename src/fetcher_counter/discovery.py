@@ -5,7 +5,10 @@ from typing import cast
 
 from loguru import logger
 
-from fetcher_counter.processes import communicate_cancellable
+from fetcher_counter.processes import (
+    communicate_cancellable,
+    create_subprocess_exec,
+)
 
 
 class FetcherDiscoveryError(RuntimeError):
@@ -21,7 +24,7 @@ async def discover_fetchers(
     logger.debug(
         "Evaluating fetchers at {} with expression {}", commit, expression
     )
-    process = await asyncio.create_subprocess_exec(
+    process = await create_subprocess_exec(
         "nix-instantiate",
         "--eval",
         "--json",

@@ -27,10 +27,12 @@ async def test_discover_fetchers_parses_sorts_and_deduplicates(
     tmp_path: Path,
 ) -> None:
     arguments: tuple[object, ...] = ()
+    options: dict[str, object] = {}
 
-    async def create_process(*values: object, **_kwargs: object) -> Process:
-        nonlocal arguments
+    async def create_process(*values: object, **kwargs: object) -> Process:
+        nonlocal arguments, options
         arguments = values
+        options = kwargs
         return Process(
             0, json.dumps(["fetchzip", "fetchurl", "fetchurl"]).encode()
         )
@@ -49,6 +51,7 @@ async def test_discover_fetchers_parses_sorts_and_deduplicates(
         "--argstr",
         "nixpkgsPath",
     )
+    assert options["start_new_session"] is True
 
 
 @pytest.mark.asyncio

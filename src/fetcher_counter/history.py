@@ -7,7 +7,11 @@ from pathlib import Path
 
 from loguru import logger
 
-from fetcher_counter.processes import TERMINATE_TIMEOUT, communicate_cancellable
+from fetcher_counter.processes import (
+    TERMINATE_TIMEOUT,
+    communicate_cancellable,
+    create_subprocess_exec,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +66,7 @@ CHECKOUT_OPTIONS = (
 
 async def _run_git(repository: Path, *arguments: str) -> bytes:
     logger.debug("Running git in {}: {}", repository, " ".join(arguments))
-    process = await asyncio.create_subprocess_exec(
+    process = await create_subprocess_exec(
         "git",
         "-C",
         str(repository),
@@ -140,7 +144,7 @@ async def sampled_commits(
         tip,
     )
     logger.debug("Running git in {}: {}", repository, " ".join(arguments))
-    process = await asyncio.create_subprocess_exec(
+    process = await create_subprocess_exec(
         "git",
         "-C",
         str(repository),
@@ -180,21 +184,24 @@ async def sampled_commits(
             with contextlib.suppress(BaseException):
                 _ = completion.result()
 
-    async def stop_git_log_process() -> None:
+    async def reconcile_git_log_process() -> None:
         nonlocal cleanup_task
         if cleanup_task is None:
             cleanup_task = asyncio.create_task(reconcile_tasks())
+        await asyncio.shield(cleanup_task)
+
+    async def stop_git_log_process() -> None:
         with contextlib.suppress(ProcessLookupError):
             process.terminate()
         try:
             await asyncio.wait_for(
-                asyncio.shield(cleanup_task),
+                reconcile_git_log_process(),
                 timeout=TERMINATE_TIMEOUT,
             )
         except TimeoutError:
             with contextlib.suppress(ProcessLookupError):
                 process.kill()
-            await asyncio.shield(cleanup_task)
+            await reconcile_git_log_process()
         except Exception as error:  # noqa: BLE001
             logger.warning("Git log cleanup failed: {}", error)
 
@@ -203,7 +210,7 @@ async def sampled_commits(
             completion
         )
     except asyncio.CancelledError:
-        await stop_git_log_process()
+        await reconcile_git_log_process()
         raise
     except Exception as error:
         await stop_git_log_process()

@@ -158,6 +158,7 @@ async def test_count_fetchers_runs_one_fixed_string_ripgrep_scan(
         ".",
     )
     assert options["cwd"] == tmp_path
+    assert options["start_new_session"] is True
 
 
 @pytest.mark.asyncio
@@ -265,6 +266,7 @@ async def test_update_fetcher_counts_applies_hunk_lines_once(
     )
     assert options["stdout"] is not None
     assert options["stderr"] is not None
+    assert options["start_new_session"] is True
 
 
 @pytest.mark.asyncio

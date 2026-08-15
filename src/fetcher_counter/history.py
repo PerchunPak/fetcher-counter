@@ -51,16 +51,23 @@ CHECKOUT_INDEX_LOCK_RETRIES = 3
 CHECKOUT_INDEX_LOCK_RETRY_DELAY = 1.0
 # Historical checkouts of Nixpkgs are dominated by index work rather than by
 # writing the few files that differ: the index holds tens of thousands of
-# entries and is rewritten on every checkout. Version 4 compresses path names,
-# skipping the trailing hash avoids checksumming the whole index, and parallel
-# workers speed up the revisions that do rewrite many files.
+# entries and is rewritten on every checkout. Version 4 compresses path names
+# and skipping the trailing hash avoids checksumming the whole index.
+#
+# Parallel checkout is deliberately disabled. Consecutive samples differ by a
+# few hundred files at most, which is far below the threshold where spawning
+# worker processes pays for itself: measured against a Nixpkgs checkout with
+# 53k index entries, `checkout.workers=0` matched plain Git defaults while
+# `checkout.workers=1` was consistently ~13% faster. Sharded runs also stop
+# oversubscribing the machine, because each shard would otherwise size its own
+# worker pool from the full CPU count.
 CHECKOUT_OPTIONS = (
     "-c",
     "index.version=4",
     "-c",
     "index.skipHash=true",
     "-c",
-    "checkout.workers=0",
+    "checkout.workers=1",
 )
 
 

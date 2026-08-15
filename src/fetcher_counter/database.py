@@ -46,6 +46,18 @@ class FetcherDatabase:
 
     async def initialize(self) -> None:
         async with self._lock:
+            # One row is committed per sampled revision, so the per-transaction
+            # cost is what matters. The rollback journal creates, fsyncs and
+            # deletes a journal file for every row; write-ahead logging appends
+            # instead. Because `sqlite3` blocks the event loop, that cost is
+            # also serialized across every shard of a parallel run.
+            #
+            # `synchronous=NORMAL` is safe here in the sense that matters: WAL
+            # never corrupts the database, it only risks losing the most recent
+            # transactions if the machine loses power. Any lost row is simply
+            # recomputed, because runs resume from the stored commit hashes.
+            _ = self._connection.execute("PRAGMA journal_mode=WAL")
+            _ = self._connection.execute("PRAGMA synchronous=NORMAL")
             _ = self._connection.execute(
                 """CREATE TABLE IF NOT EXISTS "fetchers" (
                     "commit" TEXT PRIMARY KEY,

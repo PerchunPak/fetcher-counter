@@ -165,3 +165,10 @@ therefore receive a deterministic `__case_collision_N` suffix; for example,
 Schema changes and each commit row are written in one transaction. Existing
 commit hashes are loaded at startup and skipped, making interrupted runs
 resumable without duplicate rows.
+
+The database uses write-ahead logging with `synchronous=NORMAL`, because one
+transaction is committed per sampled revision and the rollback journal's
+per-row create-fsync-delete cycle dominated that cost. Existing databases are
+switched to WAL on the next run, which adds the usual `-wal` and `-shm` sidecar
+files. Write-ahead logging never leaves the database corrupt; losing power can
+lose the most recently committed rows, which the next run simply recomputes.

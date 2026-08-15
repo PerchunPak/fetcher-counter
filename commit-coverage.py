@@ -10,11 +10,13 @@
 import argparse
 import calendar
 import math
+import os
 import sqlite3
 import subprocess
-from collections import defaultdict
-from dataclasses import dataclass
-from datetime import date, datetime
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import date
+from functools import cache, partial
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -28,15 +30,36 @@ PROCESSED = "#9C7DBF"
 TEXT = "#C9C3D6"
 MUTED_TEXT = "#89839A"
 
+Font = ImageFont.FreeTypeFont | ImageFont.ImageFont
 
-@dataclass(frozen=True, slots=True)
-class Commit:
-    hash: str
-    date: datetime
+EPOCH_ORDINAL = date(1970, 1, 1).toordinal()
+SECONDS_PER_DAY = 86400
+DEFAULT_TIP = "refs/fetcher-counter/history-tip"
+# Below this many commits the extra Git processes cost more than they save.
+PARALLEL_THRESHOLD = 20_000
 
-    @property
-    def year(self) -> int:
-        return self.date.year
+
+@dataclass(slots=True)
+class YearPanel:
+    year: int
+    coverage: list[float | None]
+    processed: int
+    total: int
+
+
+@dataclass(slots=True)
+class _YearTally:
+    year: int
+    start_day: int
+    totals: list[int]
+    completed: list[int] = field(default_factory=list)
+    commits: int = 0
+    processed: int = 0
+
+
+def default_jobs() -> int:
+    available = os.process_cpu_count() or 1
+    return max(1, min(available - 1, 12))
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,8 +116,14 @@ def parse_args() -> argparse.Namespace:
     )
     _ = parser.add_argument(
         "--tip",
-        default="refs/fetcher-counter/history-tip",
+        default=DEFAULT_TIP,
         help="Git revision to visualize (default: saved Fetcher Counter tip)",
+    )
+    _ = parser.add_argument(
+        "--jobs",
+        type=int,
+        default=default_jobs(),
+        help=f"Parallel Git date lookups (default: {default_jobs()})",
     )
     _ = parser.add_argument(
         "--no-legend",
@@ -102,7 +131,7 @@ def parse_args() -> argparse.Namespace:
         help="Omit the shared legend and overall summary",
     )
     args = parser.parse_args()
-    for name in ("interval", "rows", "columns", "cell_size"):
+    for name in ("interval", "rows", "columns", "cell_size", "jobs"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.gap < 0:
@@ -110,63 +139,123 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def git_output(repository: Path, *arguments: str) -> str:
-    result = subprocess.run(
+def decode_error(stream: bytes) -> str:
+    return stream.decode(errors="replace").strip()
+
+
+def git_run(
+    repository: Path, *arguments: str, stdin: bytes | None = None
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
         ["git", "-C", str(repository), *arguments],
         check=False,
         capture_output=True,
-        text=True,
+        input=stdin,
     )
+
+
+def git_output(
+    repository: Path, *arguments: str, stdin: bytes | None = None
+) -> bytes:
+    result = git_run(repository, *arguments, stdin=stdin)
     if result.returncode != 0:
-        message = result.stderr.strip() or "unknown Git error"
+        message = decode_error(result.stderr) or "unknown Git error"
         raise SystemExit(f"git {' '.join(arguments)} failed: {message}")
     return result.stdout
 
 
 def resolve_tip(repository: Path, requested_tip: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(repository), "rev-parse", "--verify", requested_tip],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    result = git_run(repository, "rev-parse", "--verify", requested_tip)
     if result.returncode == 0:
-        return result.stdout.strip()
-    if requested_tip == "refs/fetcher-counter/history-tip":
-        return git_output(repository, "rev-parse", "HEAD").strip()
-    message = result.stderr.strip() or "revision does not exist"
+        return result.stdout.decode().strip()
+    if requested_tip == DEFAULT_TIP:
+        return git_output(repository, "rev-parse", "HEAD").decode().strip()
+    message = decode_error(result.stderr) or "revision does not exist"
     raise SystemExit(f"cannot resolve --tip {requested_tip!r}: {message}")
 
 
-def sampled_commits(repository: Path, tip: str, interval: int) -> list[Commit]:
-    lines = git_output(
+def sampled_hashes(repository: Path, tip: str, interval: int) -> list[str]:
+    """Oldest-first first-parent hashes, sampled every ``interval`` commits.
+
+    Only hashes are asked for here: making Git format commit dates during the
+    traversal is roughly seven times slower, so dates are looked up afterwards
+    for the sampled commits alone.
+    """
+    walk = git_output(
         repository,
-        "log",
+        "rev-list",
         "--first-parent",
         "--reverse",
-        "--format=%H%x00%cI",
         tip,
-    ).splitlines()
-    commits: list[Commit] = []
-    for line in lines[::interval]:
-        commit_hash, date = line.split("\0", maxsplit=1)
-        commits.append(
-            Commit(
-                hash=commit_hash,
-                date=datetime.fromisoformat(date),
-            )
-        )
-    return commits
+    ).split()
+    return [line.decode() for line in walk[::interval]]
+
+
+def _offset_seconds(offset: bytes, known: dict[bytes, int]) -> int:
+    """Seconds to add to an epoch timestamp for a raw "±HHMM" Git offset."""
+    seconds = known.get(offset)
+    if seconds is None:
+        sign = -1 if offset[:1] == b"-" else 1
+        seconds = sign * (int(offset[1:3]) * 3600 + int(offset[3:5]) * 60)
+        known[offset] = seconds
+    return seconds
+
+
+def _lookup_days(repository: Path, chunk: list[str]) -> dict[str, int]:
+    output = git_output(
+        repository,
+        "log",
+        "--no-walk=unsorted",
+        "--format=%H%x00%cd",
+        "--date=raw",
+        "--stdin",
+        stdin="\n".join(chunk).encode(),
+    )
+    # `--date=raw` is "<epoch seconds> <±HHMM>"; shifting by the offset keeps the
+    # commit's own local calendar day, as an ISO timestamp would. Only a handful
+    # of distinct offsets occur, so their arithmetic is memoised.
+    offsets: dict[bytes, int] = {}
+    days: dict[str, int] = {}
+    for line in output.splitlines():
+        commit_hash, _, raw_date = line.partition(b"\0")
+        timestamp, _, offset = raw_date.partition(b" ")
+        seconds = int(timestamp) + _offset_seconds(offset, offsets)
+        days[commit_hash.decode()] = seconds // SECONDS_PER_DAY
+    return days
+
+
+def commit_days(repository: Path, hashes: list[str], jobs: int) -> dict[str, int]:
+    """Map each hash to its committer-local day, counted from 1970-01-01."""
+    if jobs < 2 or len(hashes) < PARALLEL_THRESHOLD:
+        days = _lookup_days(repository, hashes)
+    else:
+        size = math.ceil(len(hashes) / jobs)
+        chunks = [
+            hashes[start : start + size] for start in range(0, len(hashes), size)
+        ]
+        days = {}
+        with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+            for chunk_days in pool.map(partial(_lookup_days, repository), chunks):
+                days.update(chunk_days)
+    if len(days) != len(hashes):
+        missing = len(hashes) - len(days)
+        raise SystemExit(f"git did not report a date for {missing:,} commits")
+    return days
 
 
 def completed_commits(database: Path) -> set[str]:
     uri = f"file:{database.resolve()}?mode=ro"
     try:
         with sqlite3.connect(uri, uri=True, timeout=5) as connection:
-            rows = connection.execute('SELECT "commit" FROM "fetchers"')
-            return {str(row[0]) for row in rows}
+            rows = connection.execute('SELECT "commit" FROM "fetchers"').fetchall()
     except sqlite3.Error as error:
         raise SystemExit(f"cannot read {database}: {error}") from error
+    return {row[0] for row in rows}
+
+
+@cache
+def year_of(day: int) -> int:
+    return date.fromordinal(EPOCH_ORDINAL + day).year
 
 
 def mix(left: str, right: str, amount: float) -> str:
@@ -191,25 +280,45 @@ def coverage_color(coverage: float | None) -> str:
     return mix(PARTIAL_MID, PROCESSED, (coverage - 0.5) * 2)
 
 
-def aggregate_coverage(
-    commits: list[Commit], completed: set[str], cells: int
-) -> list[float | None]:
-    year = commits[0].year
-    start = date(year, 1, 1)
-    days = 366 if calendar.isleap(year) else 365
-    if cells < days:
-        message = f"the {year} grid needs {days} cells; grid provides {cells}"
-        raise SystemExit(message)
+def build_panels(
+    hashes: list[str], days: dict[str, int], completed: set[str], cells: int
+) -> list[YearPanel]:
+    """Bucket every sampled commit into its year grid in a single pass."""
+    tallies: dict[int, _YearTally] = {}
+    for commit_hash in hashes:
+        day = days[commit_hash]
+        year = year_of(day)
+        tally = tallies.get(year)
+        if tally is None:
+            length = 366 if calendar.isleap(year) else 365
+            if cells < length:
+                needed = f"the {year} grid needs {length} cells"
+                raise SystemExit(f"{needed}; grid provides {cells}")
+            tally = _YearTally(
+                year=year,
+                start_day=date(year, 1, 1).toordinal() - EPOCH_ORDINAL,
+                totals=[0] * cells,
+                completed=[0] * cells,
+            )
+            tallies[year] = tally
+        index = day - tally.start_day
+        tally.totals[index] += 1
+        tally.commits += 1
+        if commit_hash in completed:
+            tally.completed[index] += 1
+            tally.processed += 1
 
-    totals = [0] * cells
-    processed = [0] * cells
-    for commit in commits:
-        index = (commit.date.date() - start).days
-        totals[index] += 1
-        processed[index] += commit.hash in completed
     return [
-        done / total if total else None
-        for done, total in zip(processed, totals, strict=True)
+        YearPanel(
+            year=tally.year,
+            coverage=[
+                done / total if total else None
+                for done, total in zip(tally.completed, tally.totals, strict=True)
+            ],
+            processed=tally.processed,
+            total=tally.commits,
+        )
+        for tally in tallies.values()
     ]
 
 
@@ -257,40 +366,35 @@ def month_columns(year: int, rows: int) -> dict[int, int]:
 def draw_year(
     draw: ImageDraw.ImageDraw,
     *,
-    commits: list[Commit],
-    completed: set[str],
+    panel: YearPanel,
     top: int,
     grid_left: int,
     rows: int,
-    columns: int,
     cell_size: int,
     gap: int,
+    month_font: Font,
+    year_font: Font,
+    percent_font: Font,
 ) -> None:
     stride = cell_size + gap
-    cells = rows * columns
-    coverage = aggregate_coverage(commits, completed, cells)
-    month_font = ImageFont.load_default(size=10)
-    year_font = ImageFont.load_default(size=14)
-    percent_font = ImageFont.load_default(size=10)
     grid_top = top + 15
     grid_height = rows * stride - gap
-    year = commits[0].year
-    processed = sum(commit.hash in completed for commit in commits)
+    radius = max(2, cell_size // 4)
 
     draw.text(
         (8, grid_top + grid_height // 2 - 15),
-        str(year),
+        str(panel.year),
         fill=TEXT,
         font=year_font,
     )
     draw.text(
         (8, grid_top + grid_height // 2 + 2),
-        f"{processed / len(commits):.0%}",
+        f"{panel.processed / panel.total:.0%}",
         fill=MUTED_TEXT,
         font=percent_font,
     )
 
-    for month, column in month_columns(year, rows).items():
+    for month, column in month_columns(panel.year, rows).items():
         draw.text(
             (grid_left + column * stride, top),
             calendar.month_abbr[month],
@@ -298,22 +402,20 @@ def draw_year(
             font=month_font,
         )
 
-    for index, value in enumerate(coverage):
-        column = index // rows
-        row = index % rows
+    for index, value in enumerate(panel.coverage):
+        column, row = divmod(index, rows)
         x = grid_left + column * stride
         y = grid_top + row * stride
         draw.rounded_rectangle(
             (x, y, x + cell_size - 1, y + cell_size - 1),
-            radius=max(2, cell_size // 4),
+            radius=radius,
             fill=coverage_color(value),
         )
 
 
 def render(
-    yearly_commits: dict[int, list[Commit]],
+    panels: list[YearPanel],
     *,
-    completed: set[str],
     rows: int,
     columns: int,
     cell_size: int,
@@ -329,35 +431,35 @@ def render(
     header_height = 28 if legend else 4
     panel_height = 15 + grid_height + 15
     width = left_margin + grid_width + padding
-    height = header_height + len(yearly_commits) * panel_height + padding
+    height = header_height + len(panels) * panel_height + padding
     image = Image.new("RGB", (width, height), BACKGROUND)
     draw = ImageDraw.Draw(image)
 
-    all_commits = [
-        commit for commits in yearly_commits.values() for commit in commits
-    ]
-    processed = sum(commit.hash in completed for commit in all_commits)
     if legend:
         draw_key(
             draw,
             top=8,
             left=left_margin,
             width=width,
-            processed=processed,
-            total=len(all_commits),
+            processed=sum(panel.processed for panel in panels),
+            total=sum(panel.total for panel in panels),
         )
 
-    for panel, commits in enumerate(yearly_commits.values()):
+    month_font = ImageFont.load_default(size=10)
+    year_font = ImageFont.load_default(size=14)
+    percent_font = ImageFont.load_default(size=10)
+    for index, panel in enumerate(panels):
         draw_year(
             draw,
-            commits=commits,
-            completed=completed,
-            top=header_height + panel * panel_height,
+            panel=panel,
+            top=header_height + index * panel_height,
             grid_left=left_margin,
             rows=rows,
-            columns=columns,
             cell_size=cell_size,
             gap=gap,
+            month_font=month_font,
+            year_font=year_font,
+            percent_font=percent_font,
         )
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -373,18 +475,19 @@ def main() -> None:
     if not database.is_file():
         raise SystemExit(f"database does not exist: {database}")
 
-    tip = resolve_tip(repository, args.tip)
-    commits = sampled_commits(repository, tip, args.interval)
-    if not commits:
-        raise SystemExit("the selected history contains no commits")
-    completed = completed_commits(database)
-    yearly_commits: dict[int, list[Commit]] = defaultdict(list)
-    for commit in commits:
-        yearly_commits[commit.year].append(commit)
+    # The database read is independent of the Git work, so it runs alongside it.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending_completed = pool.submit(completed_commits, database)
+        tip = resolve_tip(repository, args.tip)
+        hashes = sampled_hashes(repository, tip, args.interval)
+        if not hashes:
+            raise SystemExit("the selected history contains no commits")
+        days = commit_days(repository, hashes, args.jobs)
+        completed = pending_completed.result()
+    panels = build_panels(hashes, days, completed, args.rows * args.columns)
 
     render(
-        dict(yearly_commits),
-        completed=completed,
+        panels,
         rows=args.rows,
         columns=args.columns,
         cell_size=args.cell_size,
@@ -393,12 +496,11 @@ def main() -> None:
         legend=not args.no_legend,
     )
 
-    processed = sum(commit.hash in completed for commit in commits)
-    selected_hashes = {commit.hash for commit in commits}
-    unmatched = len(completed - selected_hashes)
+    processed = sum(panel.processed for panel in panels)
+    unmatched = len(completed.difference(hashes))
     print(f"Wrote {args.output.resolve()}")
-    ratio = processed / len(commits)
-    print(f"Processed: {processed:,} / {len(commits):,} ({ratio:.1%})")
+    ratio = processed / len(hashes)
+    print(f"Processed: {processed:,} / {len(hashes):,} ({ratio:.1%})")
     if unmatched:
         print(f"Stored rows outside the selected sampled history: {unmatched:,}")
 

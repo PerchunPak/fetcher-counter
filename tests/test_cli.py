@@ -222,9 +222,12 @@ async def test_run_skips_completed_commits_and_persists_active_fetchers(
         *,
         interval: int,
         first_parent: bool,
+        completed: set[str] | None = None,
     ) -> list[SampledCommit]:
+        _ = completed
         assert first_parent is False
         assert interval == 50
+        assert completed == {"first"}
         return samples
 
     async def fake_checkout(_repository: Path, commit: str) -> None:
@@ -305,7 +308,9 @@ async def test_run_persists_failed_evaluation_and_continues(
         *,
         interval: int,
         first_parent: bool,
+        completed: set[str] | None = None,
     ) -> list[SampledCommit]:
+        _ = completed
         assert first_parent is True
         assert interval == 50
         return samples
@@ -373,7 +378,9 @@ async def test_run_uses_full_baseline_then_adjacent_incremental_counts(
         *,
         interval: int,
         first_parent: bool,
+        completed: set[str] | None = None,
     ) -> list[SampledCommit]:
+        _ = completed
         assert first_parent is True
         assert interval == 50
         return samples
@@ -453,7 +460,9 @@ async def test_run_forces_full_scan_at_configured_interval(
         *,
         interval: int,
         first_parent: bool,
+        completed: set[str] | None = None,
     ) -> list[SampledCommit]:
+        _ = completed
         assert first_parent is True
         assert interval == 50
         return samples
@@ -532,7 +541,9 @@ async def test_run_uses_history_position_for_scheduled_full_scan_after_resume(
         *,
         interval: int,
         first_parent: bool,
+        completed: set[str] | None = None,
     ) -> list[SampledCommit]:
+        _ = completed
         assert first_parent is True
         assert interval == 50
         return samples
@@ -600,7 +611,9 @@ async def test_run_resumes_from_adjacent_completed_row(
         *,
         interval: int,
         first_parent: bool,
+        completed: set[str] | None = None,
     ) -> list[SampledCommit]:
+        _ = completed
         assert first_parent is True
         assert interval == 50
         return samples
@@ -675,7 +688,9 @@ async def test_reverse_run_resumes_from_adjacent_completed_row(
         *,
         interval: int,
         first_parent: bool,
+        completed: set[str] | None = None,
     ) -> list[SampledCommit]:
+        _ = completed
         assert first_parent is True
         assert interval == 50
         return samples
@@ -749,7 +764,9 @@ async def test_run_falls_back_when_incremental_count_fails(
         *,
         interval: int,
         first_parent: bool,
+        completed: set[str] | None = None,
     ) -> list[SampledCommit]:
+        _ = completed
         assert first_parent is True
         assert interval == 50
         return samples
@@ -886,7 +903,9 @@ def install_fakes(
         *,
         interval: int,
         first_parent: bool,
+        completed: set[str] | None = None,
     ) -> list[SampledCommit]:
+        _ = completed
         assert first_parent is True
         assert interval == cli.DEFAULT_INTERVAL
         environment.sampled += 1
@@ -1330,7 +1349,7 @@ async def test_the_pool_lock_is_held_before_sampling_and_database_access(
     contended: list[bool] = []
 
     def on_sample() -> None:
-        assert not config.database.exists()
+        assert config.database.exists()
         try:
             with worktree_pool_lock(tmp_path / "pool"):
                 contended.append(False)

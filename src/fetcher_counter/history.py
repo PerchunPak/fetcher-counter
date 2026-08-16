@@ -225,7 +225,13 @@ async def sampled_commits(
     *,
     interval: int = 50,
     first_parent: bool = True,
+    completed: set[str] | None = None,
 ) -> list[SampledCommit]:
+    """Sample history, resolving dates only for commits not already completed.
+
+    Completed samples keep an empty date because callers discard them before
+    processing. Omitting `completed` preserves the fully dated public result.
+    """
     if interval < 1:
         raise ValueError("interval must be positive")
 
@@ -239,7 +245,22 @@ async def sampled_commits(
     commits = output.splitlines()
     offset = (len(commits) - 1) % interval
     sampled = commits[offset::interval]
-    samples = await _read_commit_dates(repository, sampled)
+    hashes = [commit.decode() for commit in sampled]
+    pending = (
+        sampled
+        if completed is None
+        else [
+            commit
+            for commit, decoded in zip(sampled, hashes, strict=True)
+            if decoded not in completed
+        ]
+    )
+    dated = await _read_commit_dates(repository, pending)
+    dates = {sample.commit: sample.date for sample in dated}
+    samples = [
+        SampledCommit(commit=commit, date=dates.get(commit, ""))
+        for commit in hashes
+    ]
     logger.debug(
         "Selected {} of {} commits with oldest-anchored interval {}",
         len(samples),

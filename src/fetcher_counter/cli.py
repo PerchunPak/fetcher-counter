@@ -440,13 +440,14 @@ async def run_single_worker(config: Config) -> None:
     No worktree pool is created or locked, so the documented behaviour of
     mutating the supplied checkout in place stays intact.
     """
-    commits = await sampled_commits(
-        config.nixpkgs,
-        interval=config.interval,
-        first_parent=config.first_parent,
-    )
     async with FetcherDatabase(config.database) as database:
         completed = await database.completed_commits()
+        commits = await sampled_commits(
+            config.nixpkgs,
+            interval=config.interval,
+            first_parent=config.first_parent,
+            completed=completed,
+        )
         pending = build_pending(
             indexed_for_traversal(commits, reverse=config.reverse), completed
         )
@@ -501,13 +502,14 @@ async def run_parallel(config: Config) -> None:
         worktrees_dir = default_worktrees_dir(config.nixpkgs.resolve())
 
     with worktree_pool_lock(worktrees_dir):
-        commits = await sampled_commits(
-            config.nixpkgs,
-            interval=config.interval,
-            first_parent=config.first_parent,
-        )
         async with FetcherDatabase(config.database) as database:
             completed = await database.completed_commits()
+            commits = await sampled_commits(
+                config.nixpkgs,
+                interval=config.interval,
+                first_parent=config.first_parent,
+                completed=completed,
+            )
             logger.debug("Skipping completed commit hashes: {}", sorted(completed))
             pending = build_pending(
                 indexed_for_traversal(commits, reverse=config.reverse), completed

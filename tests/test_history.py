@@ -200,7 +200,7 @@ async def test_sampled_commits_reads_dates_only_for_selected_revisions(
     commits = ["newest", "fourth", "third", "second", "oldest"]
     selected_chunks = [
         [("newest", 978652800)],
-        [("third", 978480000), ("oldest", 978307200)],
+        [("oldest", 978307200)],
     ]
 
     async def fake_tip(_repository: Path) -> str:
@@ -231,11 +231,12 @@ async def test_sampled_commits_reads_dates_only_for_selected_revisions(
         tmp_path,
         interval=2,
         first_parent=first_parent,
+        completed={"third"},
     )
 
     assert samples == [
         history.SampledCommit("newest", "2001-01-05T00:00:00Z"),
-        history.SampledCommit("third", "2001-01-03T00:00:00Z"),
+        history.SampledCommit("third", ""),
         history.SampledCommit("oldest", "2001-01-01T00:00:00Z"),
     ]
     assert len(calls) == 3
@@ -253,7 +254,7 @@ async def test_sampled_commits_reads_dates_only_for_selected_revisions(
 
     for call, expected_input in zip(
         calls[1:],
-        (b"newest\n", b"third\noldest\n"),
+        (b"newest\n", b"oldest\n"),
         strict=True,
     ):
         arguments, options, process = call

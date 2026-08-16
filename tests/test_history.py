@@ -197,9 +197,11 @@ async def test_sampled_commits_reads_dates_only_for_selected_revisions(
     history_arguments: tuple[str, ...],
 ) -> None:
     calls: list[tuple[tuple[object, ...], dict[str, object], Process]] = []
-    commits = ["oldest", "second", "third", "fourth", "newest"]
-    selected = ["newest", "third", "oldest"]
-    timestamps = [978652800, 978480000, 978307200]
+    commits = ["newest", "fourth", "third", "second", "oldest"]
+    selected_chunks = [
+        [("newest", 978652800)],
+        [("third", 978480000), ("oldest", 978307200)],
+    ]
 
     async def fake_tip(_repository: Path) -> str:
         return "tip"
@@ -215,17 +217,14 @@ async def test_sampled_commits_reads_dates_only_for_selected_revisions(
                 0,
                 stdout=b"".join(
                     commit_record(commit, timestamp)
-                    for commit, timestamp in zip(
-                        selected,
-                        timestamps,
-                        strict=True,
-                    )
+                    for commit, timestamp in selected_chunks[len(calls) - 1]
                 ),
             )
         calls.append((arguments, options, process))
         return process
 
     monkeypatch.setattr(history, "history_tip", fake_tip)
+    monkeypatch.setattr(history, "COMMIT_DATE_WORKERS", 2)
     monkeypatch.setattr("asyncio.create_subprocess_exec", create_process)
 
     samples = await sampled_commits(
@@ -239,7 +238,7 @@ async def test_sampled_commits_reads_dates_only_for_selected_revisions(
         history.SampledCommit("third", "2001-01-03T00:00:00Z"),
         history.SampledCommit("oldest", "2001-01-01T00:00:00Z"),
     ]
-    assert len(calls) == 2
+    assert len(calls) == 3
     arguments, options, process = calls[0]
     assert arguments == (
         "git",
@@ -247,22 +246,26 @@ async def test_sampled_commits_reads_dates_only_for_selected_revisions(
         str(tmp_path),
         "rev-list",
         *history_arguments,
-        "--reverse",
         "tip",
     )
     assert options["stdin"] is None
     assert process.input is None
 
-    arguments, options, process = calls[1]
-    assert arguments == (
-        "git",
-        "-C",
-        str(tmp_path),
-        "cat-file",
-        "--batch",
-    )
-    assert options["stdin"] == asyncio.subprocess.PIPE
-    assert process.input == b"newest\nthird\noldest\n"
+    for call, expected_input in zip(
+        calls[1:],
+        (b"newest\n", b"third\noldest\n"),
+        strict=True,
+    ):
+        arguments, options, process = call
+        assert arguments == (
+            "git",
+            "-C",
+            str(tmp_path),
+            "cat-file",
+            "--batch",
+        )
+        assert options["stdin"] == asyncio.subprocess.PIPE
+        assert process.input == expected_input
 
 
 @pytest.mark.asyncio

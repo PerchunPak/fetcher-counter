@@ -451,7 +451,10 @@ async def run_single_worker(config: Config) -> None:
         pending = build_pending(
             indexed_for_traversal(commits, reverse=config.reverse), completed
         )
-        logger.debug("Skipping completed commit hashes: {}", sorted(completed))
+        logger.opt(lazy=True).debug(
+            "Skipping completed commit hashes: {}",
+            lambda: sorted(completed),
+        )
         logger.info(
             "Found {} sampled commits; {} remain",
             len(commits),
@@ -510,7 +513,10 @@ async def run_parallel(config: Config) -> None:
                 first_parent=config.first_parent,
                 completed=completed,
             )
-            logger.debug("Skipping completed commit hashes: {}", sorted(completed))
+            logger.opt(lazy=True).debug(
+                "Skipping completed commit hashes: {}",
+                lambda: sorted(completed),
+            )
             pending = build_pending(
                 indexed_for_traversal(commits, reverse=config.reverse), completed
             )

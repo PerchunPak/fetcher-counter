@@ -3,8 +3,6 @@ from typing import Any
 
 from loguru import logger
 
-TERMINATE_TIMEOUT = 5.0
-
 
 async def create_subprocess_exec(
     program: str,
@@ -41,6 +39,7 @@ async def create_subprocess_exec(
 
 async def communicate_cancellable(
     process: asyncio.subprocess.Process,
+    input: bytes | None = None,
 ) -> tuple[bytes, bytes]:
     """Communicate with `process`, waiting it out when the caller is cancelled.
 
@@ -49,7 +48,9 @@ async def communicate_cancellable(
     draining its pipes until the command exits, after which cancellation is
     propagated and no subsequent command can start.
     """
-    communication = asyncio.create_task(process.communicate())
+    communication = asyncio.create_task(
+        process.communicate() if input is None else process.communicate(input)
+    )
     try:
         return await asyncio.shield(communication)
     except asyncio.CancelledError:

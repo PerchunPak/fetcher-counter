@@ -20,9 +20,14 @@ class FakeProcess:
         self.output: tuple[bytes, bytes] = output
         self.error: Exception | None = error
         self.drained: int = 0
+        self.input: bytes | None = None
         self.exited: asyncio.Event = asyncio.Event()
 
-    async def communicate(self) -> tuple[bytes, bytes]:
+    async def communicate(
+        self,
+        input: bytes | None = None,
+    ) -> tuple[bytes, bytes]:
+        self.input = input
         _ = await self.exited.wait()
         self.drained += 1
         if self.error is not None:
@@ -115,6 +120,18 @@ async def test_communicate_returns_process_output() -> None:
         b"stderr",
     )
     assert process.drained == 1
+
+
+@pytest.mark.asyncio
+async def test_communicate_forwards_standard_input() -> None:
+    process = FakeProcess(output=(b"stdout", b"stderr"))
+    process.exited.set()
+
+    assert await communicate_cancellable(as_process(process), b"input") == (
+        b"stdout",
+        b"stderr",
+    )
+    assert process.input == b"input"
 
 
 @pytest.mark.asyncio

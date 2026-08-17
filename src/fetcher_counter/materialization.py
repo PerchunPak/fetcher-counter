@@ -417,6 +417,7 @@ class MaterializedWorktree:
             raise
 
     async def native_checkout(self, commit: str) -> None:
+        self.recovery_required = True
         self._write_state(dirty=True)
         if self.state_path is not None:
             _ = await run_git(self.path, "clean", "-ffdx")
@@ -484,8 +485,7 @@ class MaterializedWorktree:
         )
 
     async def restore_pristine(self) -> None:
-        if (
-            self.current_commit is not None
-            and self.current_commit != self.native_commit
+        if self.current_commit is not None and (
+            self.recovery_required or self.current_commit != self.native_commit
         ):
             await self.native_checkout(self.current_commit)

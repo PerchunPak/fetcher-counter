@@ -279,6 +279,31 @@ async def test_dirty_marker_recovers_with_clean_native_checkout(
     assert recovered.native_commit == second
 
 
+@pytest.mark.asyncio
+async def test_restore_recovers_dirty_state_even_when_native_commit_matches(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    commit = write_tree(repository, {b"value": ("file", b"one")})
+    worker = tmp_path / "worker"
+    state_path = tmp_path / "state.json"
+    _ = run_git(repository, "worktree", "add", "--detach", str(worker), commit)
+    materialized = MaterializedWorktree(repository, worker, state_path)
+    await materialized.native_checkout(commit)
+    materialized.recovery_required = True
+    materialized._write_state(dirty=True)
+    _ = (worker / "stale.nix").write_text("stale")
+
+    await materialized.restore_pristine()
+
+    assert not (worker / "stale.nix").exists()
+    assert materialized.recovery_required is False
+    restored = MaterializedWorktree(repository, worker, state_path)
+    assert restored.current_commit == commit
+    assert restored.native_commit == commit
+    assert restored.recovery_required is False
+
+
 def test_malformed_marker_requires_recovery(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     _ = state_path.write_text("not json")

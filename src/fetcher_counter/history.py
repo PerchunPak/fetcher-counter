@@ -104,6 +104,14 @@ async def _run_git(
     return stdout
 
 
+async def run_git(
+    repository: Path,
+    *arguments: str,
+    input: bytes | None = None,
+) -> bytes:
+    return await _run_git(repository, *arguments, input=input)
+
+
 async def history_tip(repository: Path) -> str:
     head = (await _run_git(repository, "rev-parse", "HEAD")).decode().strip()
     try:

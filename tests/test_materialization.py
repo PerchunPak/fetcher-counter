@@ -225,3 +225,64 @@ async def test_materialization_reconciles_stale_blocking_paths(
     await materialized.materialize(second)
 
     assert (worker / "parent" / "child").read_bytes() == b"target"
+
+
+@pytest.mark.asyncio
+async def test_clean_marker_restores_logical_and_native_commits(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    first = write_tree(repository, {b"value": ("file", b"one")})
+    second = write_tree(repository, {b"value": ("file", b"two")})
+    worker = tmp_path / "worker"
+    state_path = tmp_path / "state.json"
+    _ = run_git(repository, "worktree", "add", "--detach", str(worker), first)
+    original = MaterializedWorktree(repository, worker, state_path)
+    await original.native_checkout(first)
+    await original.materialize(second)
+
+    restored = MaterializedWorktree(repository, worker, state_path)
+
+    assert restored.current_commit == second
+    assert restored.native_commit == first
+    assert restored.recovery_required is False
+
+
+@pytest.mark.asyncio
+async def test_dirty_marker_recovers_with_clean_native_checkout(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    first = write_tree(repository, {b"value": ("file", b"one")})
+    second = write_tree(repository, {b"value": ("file", b"two")})
+    worker = tmp_path / "worker"
+    state_path = tmp_path / "state.json"
+    _ = run_git(repository, "worktree", "add", "--detach", str(worker), first)
+    original = MaterializedWorktree(repository, worker, state_path)
+    await original.native_checkout(first)
+    original._write_state(dirty=True)
+    _ = (worker / "value").write_text("interrupted")
+    _ = (worker / "stale.nix").write_text("stale")
+
+    recovered = MaterializedWorktree(repository, worker, state_path)
+    await recovered.native_checkout(second)
+
+    assert (worker / "value").read_bytes() == b"two"
+    assert not (worker / "stale.nix").exists()
+    assert run_git(worker, "status", "--porcelain", "--ignored=matching") == ""
+    assert recovered.current_commit == second
+    assert recovered.native_commit == second
+
+
+def test_malformed_marker_requires_recovery(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    _ = state_path.write_text("not json")
+
+    materialized = MaterializedWorktree(
+        tmp_path / "repository",
+        tmp_path / "worker",
+        state_path,
+    )
+
+    assert materialized.current_commit is None
+    assert materialized.recovery_required is True

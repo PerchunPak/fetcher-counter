@@ -1,4 +1,5 @@
 import fcntl
+import json
 import os
 import re
 import shutil
@@ -17,6 +18,10 @@ from fetcher_counter.history import (
     parse_worktree_list,
     provision_worktrees,
     worktree_pool_lock,
+)
+from fetcher_counter.materialization import (
+    MaterializedWorktree,
+    state_path_for_worker,
 )
 from tests.conftest import GIT, commit_file, run_git
 
@@ -154,6 +159,62 @@ async def test_rejects_a_worktree_holding_any_state(
 
     assert stray.read_text() == "stray"
     assert (pool / "worker-0" / ".git").exists()
+
+
+@pytest.mark.asyncio
+async def test_reuses_a_recognized_incrementally_materialized_worktree(
+    repository: Path,
+    pool: Path,
+) -> None:
+    first = commit_file(repository, 1)
+    second = commit_file(repository, 2)
+    pool.mkdir()  # noqa: ASYNC240
+    worktrees = await provision(repository, pool, WorktreeRequest(0, first))
+    worker = worktrees[0]
+    materialized = MaterializedWorktree(
+        repository,
+        worker,
+        state_path_for_worker(pool, 0),
+    )
+    await materialized.native_checkout(first)
+    await materialized.materialize(second)
+
+    reused = await provision(repository, pool, WorktreeRequest(0, second))
+
+    assert reused == {0: worker}
+    assert (worker / "value.txt").read_text() == "2"
+    assert run_git(worker, "rev-parse", "HEAD") == first
+
+
+@pytest.mark.asyncio
+async def test_rejects_dirty_worker_with_identity_mismatched_marker(
+    repository: Path,
+    pool: Path,
+) -> None:
+    first = commit_file(repository, 1)
+    pool.mkdir()  # noqa: ASYNC240
+    worktrees = await provision(repository, pool, WorktreeRequest(0, first))
+    worker = worktrees[0]
+    _ = (worker / "value.txt").write_text("dirty")
+    state_path = state_path_for_worker(pool, 0)
+    state_path.parent.mkdir()
+    _ = state_path.write_text(
+        json.dumps(
+            {
+                "repository": str(repository / "other"),
+                "worktree": str(worker),
+                "current_commit": first,
+                "native_commit": first,
+                "dirty": False,
+                "version": 1,
+            }
+        )
+    )
+
+    with pytest.raises(WorktreeError, match="is not pristine"):
+        _ = await provision(repository, pool, WorktreeRequest(0, first))
+
+    assert (worker / "value.txt").read_text() == "dirty"
 
 
 @pytest.mark.asyncio

@@ -421,12 +421,16 @@ def _validate_registered_worktree(record: WorktreeRecord, path: Path) -> None:
         )
 
 
-async def _require_pristine_worktree(path: Path) -> None:
-    """Refuse a worker worktree holding any state at all.
+async def _require_reusable_worktree(
+    repository: Path,
+    path: Path,
+    state_path: Path,
+) -> None:
+    """Accept pristine workers or state owned by this materializer.
 
-    Ignored files matter as much as untracked ones: a later historical
-    checkout can un-ignore a stray `.nix` file, which `count_fetchers()`
-    would then count, and any stray file can obstruct that checkout.
+    A valid project marker distinguishes an intentional incremental tree or an
+    interrupted managed update from arbitrary user state. Dirty workers without
+    that ownership proof are still left untouched.
     """
     status = await _run_git(
         path,
@@ -437,11 +441,18 @@ async def _require_pristine_worktree(path: Path) -> None:
     )
     if not status:
         return
+    from fetcher_counter.materialization import (  # noqa: PLC0415
+        marker_allows_managed_recovery,
+    )
+
+    if marker_allows_managed_recovery(state_path, repository, path):
+        logger.debug("Reusing managed materialized worktree {}", path)
+        return
     detail = status.decode(errors="replace").strip().splitlines()
     raise WorktreeError(
         f"worker worktree {path} is not pristine: "
         + f"{'; '.join(detail[:STATUS_DETAIL_LINES])}. Inspect and clean it"
-        + " manually; fetcher-counter never resets a worktree"
+        + " manually; fetcher-counter only resets recognized managed state"
     )
 
 
@@ -500,8 +511,16 @@ async def provision_worktrees(
             records[target] = WorktreeRecord(path=path)
         else:
             _validate_registered_worktree(record, path)
-            await _require_pristine_worktree(path)
-            logger.debug("Reusing pristine worker worktree {}", path)
+            from fetcher_counter.materialization import (  # noqa: PLC0415
+                state_path_for_worker,
+            )
+
+            await _require_reusable_worktree(
+                repository,
+                path,
+                state_path_for_worker(pool_dir, request.index),
+            )
+            logger.debug("Reusing worker worktree {}", path)
         assigned[target] = request.index
         worktrees[request.index] = path
 

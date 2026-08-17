@@ -17,6 +17,7 @@ from loguru import logger
 from fetcher_counter.history import checkout, run_git
 
 STATE_VERSION = 1
+STATE_DIRECTORY = "materialization-state"
 REGULAR_MODES = {b"100644", b"100755"}
 SYMLINK_MODE = b"120000"
 GITLINK_MODE = b"160000"
@@ -306,6 +307,10 @@ def apply_tree_delta(
     return len(removals), writes, symlinks, executable_changes, byte_count
 
 
+def state_path_for_worker(pool_dir: Path, index: int) -> Path:
+    return pool_dir / STATE_DIRECTORY / f"worker-{index}.json"
+
+
 def _canonical(path: Path) -> str:
     return str(path.resolve(strict=False))
 
@@ -411,7 +416,7 @@ class MaterializedWorktree:
 
     async def native_checkout(self, commit: str) -> None:
         self._write_state(dirty=True)
-        if self.recovery_required and self.state_path is not None:
+        if self.state_path is not None:
             _ = await run_git(self.path, "clean", "-ffdx")
         await checkout(self.path, commit)
         head = (await run_git(self.path, "rev-parse", "HEAD")).decode().strip()
@@ -419,6 +424,15 @@ class MaterializedWorktree:
             raise MaterializationError(
                 f"native checkout selected {head} instead of {commit}"
             )
+        status = await run_git(
+            self.path,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+        )
+        if status:
+            raise MaterializationError("native checkout left the worktree dirty")
         self.current_commit = commit
         self.native_commit = commit
         self.recovery_required = False

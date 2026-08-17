@@ -37,9 +37,14 @@ from fetcher_counter.history import (
     sampled_commits,
     worktree_pool_lock,
 )
+from fetcher_counter.materialization import (
+    MaterializedWorktree,
+    state_path_for_worker,
+)
 
 DEFAULT_INTERVAL = 50
 DEFAULT_FULL_SCAN_INTERVAL = 25
+DEFAULT_NATIVE_CHECKOUT_INTERVAL = 25
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_WORKERS = 1
 LOG_LEVELS = ("TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL")
@@ -60,6 +65,7 @@ class Config:
     expression: Path
     interval: int = DEFAULT_INTERVAL
     full_scan_interval: int = DEFAULT_FULL_SCAN_INTERVAL
+    native_checkout_interval: int = DEFAULT_NATIVE_CHECKOUT_INTERVAL
     log_level: str = DEFAULT_LOG_LEVEL
     workers: int = DEFAULT_WORKERS
     reverse: bool = False
@@ -154,6 +160,12 @@ def parse_args(arguments: list[str] | None = None) -> Config:
         help="sampled iterations between full scans (default: 25)",
     )
     _ = parser.add_argument(
+        "--native-checkout-interval",
+        type=_positive_int,
+        default=DEFAULT_NATIVE_CHECKOUT_INTERVAL,
+        help="sampled iterations between native checkouts (default: 25)",
+    )
+    _ = parser.add_argument(
         "--workers",
         type=_positive_int,
         default=DEFAULT_WORKERS,
@@ -190,6 +202,7 @@ def parse_args(arguments: list[str] | None = None) -> Config:
         expression=namespace.expression,
         interval=namespace.interval,
         full_scan_interval=namespace.full_scan_interval,
+        native_checkout_interval=namespace.native_checkout_interval,
         log_level=namespace.log_level,
         workers=namespace.workers,
         reverse=namespace.reverse,
@@ -327,93 +340,136 @@ def split_pending(
 async def run_shard(
     config: Config,
     *,
-    worktree: Path,
+    materialized: MaterializedWorktree,
     pending: Sequence[PendingSample],
     database: FetcherDatabase,
     progress: Progress,
     tasks: ProgressTasks,
+    restore_pristine: bool,
 ) -> None:
-    for position, item in enumerate(pending, start=1):
-        sample = item.sample
-        logger.info("Processing {} ({}/{})", sample.commit, position, len(pending))
-        try:
-            with timed("Checkout", sample.commit):
-                await checkout(worktree, sample.commit)
+    worktree = materialized.path
+    try:
+        for position, item in enumerate(pending, start=1):
+            sample = item.sample
+            logger.info(
+                "Processing {} ({}/{})", sample.commit, position, len(pending)
+            )
             try:
-                with timed("Discovery", sample.commit):
-                    fetchers = await discover_fetchers(
-                        worktree,
-                        config.expression,
-                        commit=sample.commit,
+                scheduled_native_checkout = (
+                    item.global_index + 1
+                ) % config.native_checkout_interval == 0
+                requires_native_checkout = (
+                    scheduled_native_checkout
+                    or materialized.current_commit is None
+                    or materialized.recovery_required
+                )
+                if scheduled_native_checkout:
+                    logger.debug(
+                        "Using scheduled native checkout at {} "
+                        + "(sample iteration {})",
+                        sample.commit,
+                        item.global_index + 1,
                     )
-            except FetcherDiscoveryError as error:
-                logger.warning("Skipping {}: {}", sample.commit, error)
-                _ = await database.store(
-                    sample.commit,
-                    sample.date,
-                    {},
-                    is_skipped=True,
-                )
-                continue
-            logger.debug("Active fetchers at {}: {}", sample.commit, fetchers)
-            counts: dict[str, int] | None = None
-            scheduled_full_scan = (
-                item.global_index + 1
-            ) % config.full_scan_interval == 0
-            if scheduled_full_scan:
-                logger.debug(
-                    "Using scheduled full scan at {} (sample iteration {})",
-                    sample.commit,
-                    item.global_index + 1,
-                )
-            if item.previous_sample is not None and not scheduled_full_scan:
-                previous_counts = await database.counts_for_commit(
-                    item.previous_sample.commit,
-                    fetchers,
-                )
-                if previous_counts is not None:
+                if requires_native_checkout:
+                    with timed("Native checkout", sample.commit):
+                        await materialized.native_checkout(sample.commit)
+                else:
                     try:
-                        with timed("Incremental count", sample.commit):
-                            counts = await update_fetcher_counts(
-                                worktree,
-                                item.previous_sample.commit,
-                                sample.commit,
-                                previous_counts,
-                            )
-                    except IncrementalCountError as error:
+                        with timed("Materialization", sample.commit):
+                            await materialized.materialize(sample.commit)
+                    except Exception as error:  # noqa: BLE001
                         logger.warning(
-                            "Incremental count at {} failed; using full scan: {}",
+                            "Incremental materialization from {} to {} failed; "
+                            + "using native checkout: {}",
+                            materialized.current_commit,
                             sample.commit,
                             error,
                         )
-                    else:
-                        logger.debug(
-                            "Used counts from adjacent commit {} for {}",
-                            item.previous_sample.commit,
-                            sample.commit,
+                        with timed("Fallback native checkout", sample.commit):
+                            await materialized.native_checkout(sample.commit)
+                try:
+                    with timed("Discovery", sample.commit):
+                        fetchers = await discover_fetchers(
+                            worktree,
+                            config.expression,
+                            commit=sample.commit,
                         )
-
-            if counts is None:
-                logger.debug("Using full fetcher scan at {}", sample.commit)
-                with timed("Full scan", sample.commit):
-                    counts = await count_fetchers(
-                        worktree,
+                except FetcherDiscoveryError as error:
+                    logger.warning("Skipping {}: {}", sample.commit, error)
+                    _ = await database.store(
                         sample.commit,
+                        sample.date,
+                        {},
+                        is_skipped=True,
+                    )
+                    continue
+                logger.debug("Active fetchers at {}: {}", sample.commit, fetchers)
+                counts: dict[str, int] | None = None
+                scheduled_full_scan = (
+                    item.global_index + 1
+                ) % config.full_scan_interval == 0
+                if scheduled_full_scan:
+                    logger.debug(
+                        "Using scheduled full scan at {} (sample iteration {})",
+                        sample.commit,
+                        item.global_index + 1,
+                    )
+                if item.previous_sample is not None and not scheduled_full_scan:
+                    previous_counts = await database.counts_for_commit(
+                        item.previous_sample.commit,
                         fetchers,
                     )
-            logger.debug("Persisting counts at {}: {}", sample.commit, counts)
-            _ = await database.store(sample.commit, sample.date, counts)
-        finally:
-            progress.advance(tasks.shard)
-            if tasks.total != tasks.shard:
-                progress.advance(tasks.total)
+                    if previous_counts is not None:
+                        try:
+                            with timed("Incremental count", sample.commit):
+                                counts = await update_fetcher_counts(
+                                    worktree,
+                                    item.previous_sample.commit,
+                                    sample.commit,
+                                    previous_counts,
+                                )
+                        except IncrementalCountError as error:
+                            logger.warning(
+                                "Incremental count at {} failed; "
+                                + "using full scan: {}",
+                                sample.commit,
+                                error,
+                            )
+                        else:
+                            logger.debug(
+                                "Used counts from adjacent commit {} for {}",
+                                item.previous_sample.commit,
+                                sample.commit,
+                            )
+
+                if counts is None:
+                    logger.debug("Using full fetcher scan at {}", sample.commit)
+                    with timed("Full scan", sample.commit):
+                        counts = await count_fetchers(
+                            worktree,
+                            sample.commit,
+                            fetchers,
+                        )
+                logger.debug("Persisting counts at {}: {}", sample.commit, counts)
+                _ = await database.store(sample.commit, sample.date, counts)
+            finally:
+                progress.advance(tasks.shard)
+                if tasks.total != tasks.shard:
+                    progress.advance(tasks.total)
+    finally:
+        if restore_pristine:
+            with timed(
+                "Final native checkout",
+                materialized.current_commit or "none",
+            ):
+                await materialized.restore_pristine()
 
 
 async def _run_labelled_shard(
     config: Config,
     *,
     shard: ActiveShard,
-    worktree: Path,
+    materialized: MaterializedWorktree,
     database: FetcherDatabase,
     progress: Progress,
     tasks: ProgressTasks,
@@ -422,15 +478,16 @@ async def _run_labelled_shard(
         logger.info(
             "Processing {} pending samples in {}",
             len(shard.pending),
-            worktree,
+            materialized.path,
         )
         await run_shard(
             config,
-            worktree=worktree,
+            materialized=materialized,
             pending=shard.pending,
             database=database,
             progress=progress,
             tasks=tasks,
+            restore_pristine=True,
         )
 
 
@@ -464,11 +521,16 @@ async def run_single_worker(config: Config) -> None:
             task = progress.add_task("Total", total=len(pending))
             await run_shard(
                 config,
-                worktree=config.nixpkgs,
+                materialized=MaterializedWorktree(
+                    repository=config.nixpkgs,
+                    path=config.nixpkgs,
+                    checkout_function=checkout,
+                ),
                 pending=pending,
                 database=database,
                 progress=progress,
                 tasks=ProgressTasks(total=task, shard=task),
+                restore_pristine=False,
             )
 
 
@@ -561,7 +623,15 @@ async def run_parallel(config: Config) -> None:
                         _run_labelled_shard(
                             config,
                             shard=shard,
-                            worktree=worktrees[shard.index],
+                            materialized=MaterializedWorktree(
+                                repository=config.nixpkgs,
+                                path=worktrees[shard.index],
+                                state_path=state_path_for_worker(
+                                    worktrees_dir,
+                                    shard.index,
+                                ),
+                                checkout_function=checkout,
+                            ),
                             database=database,
                             progress=progress,
                             tasks=ProgressTasks(
@@ -584,6 +654,8 @@ async def run_parallel(config: Config) -> None:
 async def run(config: Config) -> None:
     if config.full_scan_interval < 1:
         raise ValueError("full scan interval must be positive")
+    if config.native_checkout_interval < 1:
+        raise ValueError("native checkout interval must be positive")
     if config.workers < 1:
         raise ValueError("workers must be positive")
     logger.debug("Starting fetcher counter with configuration {}", config)
@@ -602,6 +674,7 @@ def main() -> None:
         expression=parsed.expression.resolve(),
         interval=parsed.interval,
         full_scan_interval=parsed.full_scan_interval,
+        native_checkout_interval=parsed.native_checkout_interval,
         log_level=parsed.log_level,
         workers=parsed.workers,
         reverse=parsed.reverse,

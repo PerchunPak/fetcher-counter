@@ -3,12 +3,17 @@
 
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from fetcher_counter import cli
+from fetcher_counter.cli import Config, run
+from fetcher_counter.discovery import FetcherDiscoveryError
+from fetcher_counter.history import SampledCommit
 from fetcher_counter.materialization import (
     MaterializationError,
     MaterializedWorktree,
@@ -286,3 +291,130 @@ def test_malformed_marker_requires_recovery(tmp_path: Path) -> None:
 
     assert materialized.current_commit is None
     assert materialized.recovery_required is True
+
+
+@pytest.mark.asyncio
+async def test_optimized_and_native_runs_store_identical_databases(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trees = [
+        {
+            b"active": ("file", b"fetchurl\n"),
+            b"packages.nix": ("file", b"fetchurl\nfetchurl\n"),
+        },
+        {
+            b"active": ("file", b"fetchurl\nfetchzip\n"),
+            b"packages.nix": ("file", b"fetchurl fetchzip\nfetchzip\n"),
+        },
+        {
+            b"active": ("file", b"fetchzip\n"),
+            b"nested/packages.nix": ("file", b"fetchzip\n"),
+        },
+        {
+            b"active": ("file", b"fail\n"),
+            b"packages.nix": ("file", b"ignored\n"),
+        },
+        {
+            b"active": ("file", b"fetchurl\n"),
+            b"packages.nix": ("file", b"nothing\n"),
+        },
+        {
+            b"active": ("file", b"fetchurl\nfetchgit\n"),
+            b"packages.nix": ("file", b"fetchgit fetchurl\n"),
+        },
+        {
+            b"active": ("file", b"fetchgit\n"),
+            b"link.nix": ("symlink", b"packages.nix"),
+            b"packages.nix": ("file", b"fetchgit\nfetchgit\n"),
+        },
+        {
+            b"active": ("file", b"fetchurl\nfetchgit\n"),
+            b"packages.nix": ("executable", b"fetchurl\nfetchgit\n"),
+        },
+    ]
+    commits = [write_tree(repository, tree) for tree in trees]
+    samples = [
+        SampledCommit(commit, f"2026-01-{index:02d}T00:00:00Z")
+        for index, commit in enumerate(commits, start=1)
+    ]
+
+    async def fake_samples(
+        _repository: Path,
+        *,
+        interval: int,
+        first_parent: bool,
+        completed: set[str] | None = None,
+    ) -> list[SampledCommit]:
+        assert interval == 1
+        assert first_parent is False
+        assert completed == set()
+        return samples
+
+    async def discover(
+        worktree: Path,
+        _expression: Path,
+        *,
+        commit: str,
+    ) -> list[str]:
+        _ = commit
+        active = (worktree / "active").read_text().splitlines()
+        if active == ["fail"]:
+            raise FetcherDiscoveryError("synthetic failure")
+        return active
+
+    async def count(
+        worktree: Path,
+        _commit: str,
+        fetchers: list[str],
+    ) -> dict[str, int]:
+        paths = list(worktree.rglob("*.nix"))  # noqa: ASYNC240
+        lines = [
+            line
+            for path in paths
+            if not path.is_symlink()
+            for line in path.read_text().splitlines()
+        ]
+        return {
+            fetcher: sum(fetcher in line for line in lines) for fetcher in fetchers
+        }
+
+    monkeypatch.setattr(cli, "sampled_commits", fake_samples)
+    monkeypatch.setattr(cli, "discover_fetchers", discover)
+    monkeypatch.setattr(cli, "count_fetchers", count)
+
+    async def execute(name: str, native_interval: int) -> Path:
+        database = tmp_path / f"{name}.sqlite3"
+        await run(
+            Config(
+                nixpkgs=repository,
+                database=database,
+                expression=tmp_path / "expression.nix",
+                interval=1,
+                full_scan_interval=1,
+                native_checkout_interval=native_interval,
+                workers=2,
+                first_parent=False,
+                worktrees_dir=tmp_path / f"{name}-pool",
+            )
+        )
+        return database
+
+    control = await execute("control", 1)
+    optimized = await execute("optimized", 25)
+
+    def contents(
+        database: Path,
+    ) -> tuple[list[tuple[object, ...]], list[tuple[object, ...]]]:
+        connection = sqlite3.connect(database)
+        try:
+            schema = connection.execute('PRAGMA table_info("fetchers")').fetchall()
+            rows = connection.execute(
+                'SELECT * FROM "fetchers" ORDER BY "commit"'
+            ).fetchall()
+        finally:
+            connection.close()
+        return schema, rows
+
+    assert contents(optimized) == contents(control)

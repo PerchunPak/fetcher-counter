@@ -19,8 +19,46 @@ from fetcher_counter.history import (
     SampledCommit,
     WorktreePoolLockedError,
     WorktreeRequest,
+    checkout as history_checkout,
     worktree_pool_lock,
 )
+
+
+@pytest.fixture(autouse=True)
+def fake_materializer(monkeypatch: pytest.MonkeyPatch) -> None:
+    class CheckoutBackedMaterializer:
+        def __init__(
+            self,
+            repository: Path,
+            path: Path,
+            state_path: Path | None = None,
+            checkout_function: Callable[
+                [Path, str], Awaitable[None]
+            ] = history_checkout,
+        ) -> None:
+            _ = repository, state_path
+            self.path: Path = path
+            self.checkout_function: Callable[[Path, str], Awaitable[None]] = (
+                checkout_function
+            )
+            self.current_commit: str | None = None
+            self.native_commit: str | None = None
+            self.recovery_required: bool = False
+
+        async def native_checkout(self, commit: str) -> None:
+            await self.checkout_function(self.path, commit)
+            self.current_commit = commit
+            self.native_commit = commit
+
+        async def materialize(self, commit: str) -> None:
+            await self.checkout_function(self.path, commit)
+            self.current_commit = commit
+            self.native_commit = commit
+
+        async def restore_pristine(self) -> None:
+            return None
+
+    monkeypatch.setattr(cli, "MaterializedWorktree", CheckoutBackedMaterializer)
 
 
 def test_parse_args_uses_project_defaults() -> None:
@@ -30,6 +68,7 @@ def test_parse_args_uses_project_defaults() -> None:
     assert config.database == Path("data/fetchers.sqlite3")
     assert config.interval == 50
     assert config.full_scan_interval == 25
+    assert config.native_checkout_interval == 25
     assert config.log_level == "INFO"
     assert config.workers == 1
     assert config.reverse is False
@@ -41,6 +80,13 @@ def test_parse_args_accepts_full_scan_interval() -> None:
     config = parse_args(["--full-scan-interval", "7"])
 
     assert config.full_scan_interval == 7
+
+
+def test_parse_args_accepts_native_checkout_interval() -> None:
+    config = parse_args(["--native-checkout-interval", "7"])
+
+    assert config.native_checkout_interval == 7
+    assert config.full_scan_interval == 25
 
 
 def test_parse_args_accepts_reverse() -> None:
@@ -60,6 +106,11 @@ def test_parse_args_rejects_nonpositive_full_scan_interval() -> None:
         _ = parse_args(["--full-scan-interval", "0"])
 
 
+def test_parse_args_rejects_nonpositive_native_checkout_interval() -> None:
+    with pytest.raises(SystemExit):
+        _ = parse_args(["--native-checkout-interval", "0"])
+
+
 def test_parse_args_accepts_case_insensitive_log_level() -> None:
     config = parse_args(["--log-level", "debug"])
 
@@ -75,6 +126,23 @@ async def test_run_rejects_nonpositive_full_scan_interval(tmp_path: Path) -> Non
                 database=tmp_path / "fetchers.sqlite3",
                 expression=tmp_path / "get-fetchers.nix",
                 full_scan_interval=0,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_nonpositive_native_checkout_interval(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        ValueError, match="native checkout interval must be positive"
+    ):
+        await run(
+            Config(
+                nixpkgs=tmp_path / "nixpkgs",
+                database=tmp_path / "fetchers.sqlite3",
+                expression=tmp_path / "get-fetchers.nix",
+                native_checkout_interval=0,
             )
         )
 
@@ -879,6 +947,9 @@ class Environment:
         self.samples: list[SampledCommit] = samples
         self.sampled: int = 0
         self.checkouts: list[tuple[Path, str]] = []
+        self.native_checkouts: list[str] = []
+        self.materializations: list[str] = []
+        self.restorations: list[str] = []
         self.full_scans: list[str] = []
         self.updates: list[tuple[str, str]] = []
         self.requests: list[WorktreeRequest] = []
@@ -969,6 +1040,60 @@ def install_fakes(
     monkeypatch.setattr(cli, "update_fetcher_counts", fake_update)
     monkeypatch.setattr(cli, "provision_worktrees", fake_provision)
     return environment
+
+
+def install_recording_materializer(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: Environment,
+    *,
+    fail_materialization: set[str] | None = None,
+) -> None:
+    failures: set[str] = (
+        fail_materialization if fail_materialization is not None else set()
+    )
+
+    class RecordingMaterializer:
+        def __init__(
+            self,
+            repository: Path,
+            path: Path,
+            state_path: Path | None = None,
+            checkout_function: Callable[
+                [Path, str], Awaitable[None]
+            ] = history_checkout,
+        ) -> None:
+            _ = repository, state_path
+            self.path: Path = path
+            self.checkout_function: Callable[[Path, str], Awaitable[None]] = (
+                checkout_function
+            )
+            self.current_commit: str | None = None
+            self.native_commit: str | None = None
+            self.recovery_required: bool = False
+
+        async def native_checkout(self, commit: str) -> None:
+            environment.native_checkouts.append(commit)
+            await self.checkout_function(self.path, commit)
+            self.current_commit = commit
+            self.native_commit = commit
+            self.recovery_required = False
+
+        async def materialize(self, commit: str) -> None:
+            environment.materializations.append(commit)
+            if commit in failures:
+                self.recovery_required = True
+                raise RuntimeError("materialization failed")
+            self.current_commit = commit
+
+        async def restore_pristine(self) -> None:
+            if self.current_commit == self.native_commit:
+                return
+            assert self.current_commit is not None
+            environment.restorations.append(self.current_commit)
+            await self.checkout_function(self.path, self.current_commit)
+            self.native_commit = self.current_commit
+
+    monkeypatch.setattr(cli, "MaterializedWorktree", RecordingMaterializer)
 
 
 def parallel_config(tmp_path: Path, **overrides: object) -> Config:
@@ -1311,6 +1436,93 @@ async def test_scheduled_full_scans_follow_the_global_history_position(
         "commit-3",
         "commit-5",
     ]
+
+
+@pytest.mark.asyncio
+async def test_native_checkout_and_full_scan_cadences_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    samples = samples_named(*(f"commit-{number}" for number in range(12)))
+    environment = install_fakes(monkeypatch, samples)
+    install_recording_materializer(monkeypatch, environment)
+
+    await run(
+        parallel_config(
+            tmp_path,
+            workers=1,
+            worktrees_dir=None,
+            native_checkout_interval=3,
+            full_scan_interval=4,
+        )
+    )
+
+    assert environment.native_checkouts == [
+        "commit-0",
+        "commit-2",
+        "commit-5",
+        "commit-8",
+        "commit-11",
+    ]
+    assert environment.materializations == [
+        "commit-1",
+        "commit-3",
+        "commit-4",
+        "commit-6",
+        "commit-7",
+        "commit-9",
+        "commit-10",
+    ]
+    assert environment.full_scans == [
+        "commit-0",
+        "commit-3",
+        "commit-7",
+        "commit-11",
+    ]
+    assert ("commit-1", "commit-2") in environment.updates
+    assert ("commit-2", "commit-3") not in environment.updates
+
+
+@pytest.mark.asyncio
+async def test_materialization_failure_falls_back_without_forcing_full_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    environment = install_fakes(monkeypatch, samples_named("first", "second"))
+    install_recording_materializer(
+        monkeypatch,
+        environment,
+        fail_materialization={"second"},
+    )
+
+    await run(
+        parallel_config(
+            tmp_path,
+            workers=1,
+            worktrees_dir=None,
+            native_checkout_interval=25,
+        )
+    )
+
+    assert environment.native_checkouts == ["first", "second"]
+    assert environment.materializations == ["second"]
+    assert environment.full_scans == ["first"]
+    assert environment.updates == [("first", "second")]
+
+
+@pytest.mark.asyncio
+async def test_parallel_shards_restore_incremental_final_trees(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    environment = install_fakes(monkeypatch, samples_named("a", "b", "c", "d"))
+    install_recording_materializer(monkeypatch, environment)
+
+    await run(parallel_config(tmp_path, native_checkout_interval=25))
+
+    assert sorted(environment.native_checkouts) == ["a", "c"]
+    assert sorted(environment.materializations) == ["b", "d"]
+    assert sorted(environment.restorations) == ["b", "d"]
 
 
 @pytest.mark.asyncio

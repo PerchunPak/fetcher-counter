@@ -23,13 +23,15 @@ uv run fetcher-counter
 ```
 
 The default database is `./data/fetchers.sqlite3`. Paths, the commit sampling
-interval, and the full-scan interval can be overridden:
+interval, the native-checkout interval, and the full-scan interval can be
+overridden:
 
 ```console
 uv run fetcher-counter \
   --nixpkgs /path/to/nixpkgs \
   --database /path/to/fetchers.sqlite3 \
   --interval 50 \
+  --native-checkout-interval 25 \
   --full-scan-interval 25 \
   --workers 4 \
   --reverse \
@@ -42,8 +44,9 @@ uv run fetcher-counter \
 `CRITICAL` and defaults to `INFO`. Each log line is labelled with the shard that
 emitted it, or with `main` for the coordinator itself.
 
-With the default `--workers 1`, the process checks out historical revisions
-directly in the supplied Nixpkgs checkout. It deliberately does not restore the
+With the default `--workers 1`, the process materializes historical revisions
+directly in the supplied Nixpkgs checkout, using native Git checkout for the
+first sample and periodic refreshes. It deliberately does not restore the
 original revision after success or failure. Do not run it against a checkout
 whose current state you need to preserve.
 
@@ -66,6 +69,8 @@ default and overridable with `--worktrees-dir`:
 
 ```
 <pool>/coordinator.lock
+<pool>/materialization-state/worker-0.json
+<pool>/materialization-state/worker-1.json
 <pool>/worker-0
 <pool>/worker-1
 ```
@@ -77,11 +82,22 @@ directory and its lock file are created even when no work turns out to be
 pending; the lock file stays on disk between runs, because the advisory lock
 rather than the file marks ownership.
 
-Worker worktrees are reused across runs, but only when Git reports them as
-registered, unlocked, not prunable, and entirely pristine, including untracked
-and ignored files. A stray `.nix` file would otherwise be counted after a later
-historical checkout un-ignores it. Nothing in the pool is ever cleaned, reset,
-or deleted: unexpected state is reported so it can be inspected manually.
+Worker worktrees are reused across runs when Git reports them as registered,
+unlocked, and not prunable. They must either be entirely pristine or have a
+recognized project-owned materialization marker. The marker records the logical
+filesystem commit independently from Git `HEAD` and the index, and marks an
+update dirty before any files change. A clean marker allows incremental reuse;
+a dirty or malformed managed marker forces native checkout recovery. Arbitrary
+dirty worktrees without a matching marker, including untracked and ignored
+files, are still refused and left untouched.
+
+Normal samples update the materialized filesystem directly from Git tree and
+blob objects without rewriting the index. Regular files, executable modes, and
+symlinks are reproduced using raw byte paths; unsupported entries such as a
+gitlink transition fall back to native checkout. Persistent workers receive a
+final native checkout after each shard, so successful runs leave them pristine.
+Fallback events and per-transition file/byte totals are available at `DEBUG` log
+level.
 
 Shards share the single database connection, so all writes stay serialized and
 each shard's progress is durable on its own. If one shard fails, its siblings
@@ -118,6 +134,15 @@ and selects attribute names matching `fetch.*`. It handles the historical
 represented by an empty active fetcher set. If Nix evaluation fails, the commit
 is persisted with `is_skipped = 1` and no fetcher counts, then processing
 continues with the next sample.
+
+Filesystem materialization and fetcher-count verification use independent
+cadences. The first revision without trusted worker state uses native checkout;
+normal revisions apply an exact Git-object tree delta, and every 25th global
+sampled position refreshes through native checkout by default. Change that
+schedule with `--native-checkout-interval`. This does not force a full count.
+Likewise, `--full-scan-interval` does not force native checkout. When both
+schedules coincide, the program performs one native checkout followed by one
+full count.
 
 The first revision without a valid adjacent result uses one ripgrep process to
 scan all Nix files for every active fetcher as fixed-string, whole-word patterns.

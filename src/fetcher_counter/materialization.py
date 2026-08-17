@@ -8,6 +8,7 @@ import os
 import shutil
 import stat
 import tempfile
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -358,6 +359,7 @@ class MaterializedWorktree:
     repository: Path
     path: Path
     state_path: Path | None = None
+    checkout_function: Callable[[Path, str], Awaitable[None]] = checkout
     current_commit: str | None = None
     native_commit: str | None = None
     recovery_required: bool = False
@@ -418,7 +420,7 @@ class MaterializedWorktree:
         self._write_state(dirty=True)
         if self.state_path is not None:
             _ = await run_git(self.path, "clean", "-ffdx")
-        await checkout(self.path, commit)
+        await self.checkout_function(self.path, commit)
         head = (await run_git(self.path, "rev-parse", "HEAD")).decode().strip()
         if head != commit:
             raise MaterializationError(

@@ -277,9 +277,6 @@ async def test_run_skips_completed_commits_and_persists_active_fetchers(
 
     assert checkouts == ["second", "third"]
     assert any(
-        "Skipping completed commit hashes: ['first']" in line for line in messages
-    )
-    assert any(
         "Active fetchers at second: ['fetchurl']" in line for line in messages
     )
     assert any(

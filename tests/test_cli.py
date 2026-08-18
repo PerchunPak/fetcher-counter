@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import sqlite3
 import sys
 from collections.abc import Awaitable, Callable, Sequence
@@ -1875,6 +1876,72 @@ async def test_external_cancellation_cancels_every_shard(
     assert sorted(cancelled) == ["a", "c"]
     with worktree_pool_lock(tmp_path / "pool"):
         pass
+
+
+def test_main_forwards_every_parsed_option(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """`main()` must not drop options between parsing and running.
+
+    Enumerating the fields keeps this honest as options are added: rebuilding
+    the configuration by hand once dropped the incremental limits, which were
+    accepted on the command line and then silently replaced by their defaults.
+    """
+    nixpkgs = tmp_path / "nixpkgs"
+    nixpkgs.mkdir()
+    expression = tmp_path / "get-fetchers.nix"
+    _ = expression.write_text("[]")
+    configurations: list[Config] = []
+
+    async def fake_run(config: Config) -> None:
+        configurations.append(config)
+
+    def fake_configure_logging(_log_level: str) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    monkeypatch.setattr(cli, "configure_logging", fake_configure_logging)
+    argv = [
+        "fetcher-counter",
+        "--nixpkgs",
+        str(nixpkgs),
+        "--database",
+        str(tmp_path / "fetchers.sqlite3"),
+        "--expression",
+        str(expression),
+        "--interval",
+        "7",
+        "--full-scan-interval",
+        "11",
+        "--native-checkout-interval",
+        "13",
+        "--max-incremental-paths",
+        "17",
+        "--max-incremental-bytes",
+        "19",
+        "--workers",
+        "3",
+        "--reverse",
+        "--no-first-parent",
+        "--worktrees-dir",
+        str(tmp_path / "pool"),
+        "--log-level",
+        "WARNING",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    expected = parse_args(argv[1:])
+
+    cli.main()
+
+    [config] = configurations
+    resolved = {"nixpkgs", "database", "expression", "worktrees_dir"}
+    for field in dataclasses.fields(Config):
+        if field.name in resolved:
+            continue
+        assert getattr(config, field.name) == getattr(expected, field.name), (
+            f"main() dropped --{field.name.replace('_', '-')}"
+        )
 
 
 def test_main_derives_the_pool_from_the_resolved_nixpkgs_path(

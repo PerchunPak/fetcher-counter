@@ -717,17 +717,15 @@ async def run(config: Config) -> None:
 def main() -> None:
     parsed = parse_args()
     nixpkgs = parsed.nixpkgs.resolve()
-    config = Config(
+    # Adjust the parsed configuration rather than rebuilding one field by
+    # field. Re-listing every field meant a newly added option was parsed and
+    # then silently dropped here, so the program ran with its default while
+    # accepting the flag without complaint.
+    config = replace(
+        parsed,
         nixpkgs=nixpkgs,
         database=parsed.database.resolve(),
         expression=parsed.expression.resolve(),
-        interval=parsed.interval,
-        full_scan_interval=parsed.full_scan_interval,
-        native_checkout_interval=parsed.native_checkout_interval,
-        log_level=parsed.log_level,
-        workers=parsed.workers,
-        reverse=parsed.reverse,
-        first_parent=parsed.first_parent,
         worktrees_dir=(
             parsed.worktrees_dir.resolve()
             if parsed.worktrees_dir is not None

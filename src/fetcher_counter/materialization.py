@@ -659,7 +659,18 @@ class MaterializedWorktree:
                     error,
                 )
                 targeted = False
-        if not targeted and self.state_path is not None:
+        # Recovery starts from untrusted worktree contents, so it resets them
+        # wholesale and then verifies the result. Both walk all 50k files of a
+        # Nixpkgs worktree, which is why neither runs on the hot path, where
+        # the discarded-path set is exact and covered by tests.
+        #
+        # Only a managed pool worker is ever reset: an unmanaged worktree --
+        # the supplied checkout in single-worker mode -- is documented as
+        # deliberately mutated, so it is neither cleaned nor asserted upon.
+        # Asserting without cleaning would abort on pre-existing dirt that
+        # this program never promised to remove.
+        recovering = not targeted and self.state_path is not None
+        if recovering:
             _ = await run_git(self.path, "clean", "-ffdx")
         await self.checkout_function(self.path, commit)
         head = (await run_git(self.path, "rev-parse", "HEAD")).decode().strip()
@@ -667,10 +678,7 @@ class MaterializedWorktree:
             raise MaterializationError(
                 f"native checkout selected {head} instead of {commit}"
             )
-        if not targeted:
-            # Recovery starts from untrusted worktree contents, so the full
-            # walk is worth its cost here. It is skipped on the hot path,
-            # where the discarded-path set is exact and covered by tests.
+        if recovering:
             status = await run_git(
                 self.path,
                 "status",

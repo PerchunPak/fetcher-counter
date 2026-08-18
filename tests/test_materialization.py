@@ -497,6 +497,30 @@ async def test_clean_marker_restores_logical_and_native_commits(
 
 
 @pytest.mark.asyncio
+async def test_unmanaged_worktree_is_neither_cleaned_nor_asserted(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    """Single-worker mode mutates the supplied checkout deliberately.
+
+    Without a state marker there is no managed pool worker to reset, so
+    pre-existing dirt must not be removed and must not abort the run either.
+    """
+    first = write_tree(repository, {b"value": ("file", b"one")})
+    second = write_tree(repository, {b"value": ("file", b"two")})
+    worker = tmp_path / "worker"
+    _ = run_git(repository, "worktree", "add", "--detach", str(worker), first)
+    _ = (worker / "untracked.txt").write_text("mine")
+    materialized = MaterializedWorktree(repository, worker)
+
+    await materialized.native_checkout(second)
+
+    assert (worker / "value").read_bytes() == b"two"
+    assert (worker / "untracked.txt").read_text() == "mine"
+    assert materialized.current_commit == second
+
+
+@pytest.mark.asyncio
 async def test_marker_is_written_once_per_clean_interval(
     repository: Path,
     tmp_path: Path,

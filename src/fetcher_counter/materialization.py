@@ -2,6 +2,7 @@
 # deliberately unsuitable in the filesystem layer.
 # ruff: noqa: PTH101, PTH102, PTH105, PTH106, PTH108, PTH118, PTH120, PTH211
 
+import asyncio
 import contextlib
 import json
 import os
@@ -180,7 +181,7 @@ async def read_target_blobs(
         "--batch",
         input=b"\n".join(objects) + b"\n",
     )
-    return parse_batch_blobs(output, objects)
+    return await asyncio.to_thread(parse_batch_blobs, output, objects)
 
 
 def _absolute(root: bytes, relative: bytes) -> bytes:
@@ -261,11 +262,12 @@ def _remove_empty_parents(root: bytes, relative: bytes) -> None:
         parent = os.path.dirname(parent)
 
 
-def apply_tree_delta(
-    worktree: Path,
-    deltas: list[TreeDelta],
-    blobs: dict[bytes, bytes],
-) -> tuple[int, int, int, int, int]:
+def apply_removals(worktree: Path, deltas: list[TreeDelta]) -> int:
+    """Remove every old side, deepest paths first.
+
+    Removals must all precede writes so a path that changes type, or a
+    directory that becomes a file, never collides with its own replacement.
+    """
     root = os.fsencode(worktree)
     removals = sorted(
         (delta.path for delta in deltas if delta.old_mode != b"000000"),
@@ -274,7 +276,15 @@ def apply_tree_delta(
     )
     for relative in removals:
         _remove_path(_absolute(root, relative))
+    return len(removals)
 
+
+def apply_writes(
+    worktree: Path,
+    deltas: list[TreeDelta],
+    blobs: dict[bytes, bytes],
+) -> tuple[int, int, int, int]:
+    root = os.fsencode(worktree)
     writes = 0
     symlinks = 0
     executable_changes = 0
@@ -301,11 +311,28 @@ def apply_tree_delta(
             symlinks += 1
         else:
             raise NativeCheckoutRequiredError("unsupported target mode")
+    return writes, symlinks, executable_changes, byte_count
 
+
+def prune_empty_parents(worktree: Path, deltas: list[TreeDelta]) -> None:
+    root = os.fsencode(worktree)
     for delta in deltas:
         if delta.new_mode == b"000000":
             _remove_empty_parents(root, delta.path)
-    return len(removals), writes, symlinks, executable_changes, byte_count
+
+
+def apply_tree_delta(
+    worktree: Path,
+    deltas: list[TreeDelta],
+    blobs: dict[bytes, bytes],
+) -> tuple[int, int, int, int, int]:
+    """Apply a whole delta in one call, in the required stage order."""
+    removed = apply_removals(worktree, deltas)
+    writes, symlinks, executable_changes, byte_count = apply_writes(
+        worktree, deltas, blobs
+    )
+    prune_empty_parents(worktree, deltas)
+    return removed, writes, symlinks, executable_changes, byte_count
 
 
 def state_path_for_worker(pool_dir: Path, index: int) -> Path:
@@ -416,9 +443,18 @@ class MaterializedWorktree:
                 os.unlink(temporary)
             raise
 
+    async def _store_state(self, *, dirty: bool) -> None:
+        """Persist the marker without stalling the shared event loop.
+
+        The marker is fsynced, and on Btrfs an fsync is a filesystem-wide
+        transaction commit. Every shard runs in this one process, so doing
+        that inline would block all of them.
+        """
+        await asyncio.to_thread(self._write_state, dirty=dirty)
+
     async def native_checkout(self, commit: str) -> None:
         self.recovery_required = True
-        self._write_state(dirty=True)
+        await self._store_state(dirty=True)
         if self.state_path is not None:
             _ = await run_git(self.path, "clean", "-ffdx")
         await self.checkout_function(self.path, commit)
@@ -439,7 +475,7 @@ class MaterializedWorktree:
         self.current_commit = commit
         self.native_commit = commit
         self.recovery_required = False
-        self._write_state(dirty=False)
+        await self._store_state(dirty=False)
 
     async def materialize(self, commit: str) -> None:
         if self.current_commit is None or self.recovery_required:
@@ -447,7 +483,7 @@ class MaterializedWorktree:
         if self.current_commit == commit:
             return
         base = self.current_commit
-        self._write_state(dirty=True)
+        await self._store_state(dirty=True)
         try:
             output = await run_git(
                 self.repository,
@@ -461,7 +497,14 @@ class MaterializedWorktree:
             )
             deltas = parse_raw_tree_delta(output)
             blobs = await read_target_blobs(self.repository, deltas)
-            removed, writes, symlinks, modes, bytes_written = apply_tree_delta(
+            (
+                removed,
+                writes,
+                symlinks,
+                modes,
+                bytes_written,
+            ) = await asyncio.to_thread(
+                apply_tree_delta,
                 self.path,
                 deltas,
                 blobs,
@@ -471,7 +514,7 @@ class MaterializedWorktree:
             raise
         self.current_commit = commit
         self.recovery_required = False
-        self._write_state(dirty=False)
+        await self._store_state(dirty=False)
         logger.debug(
             "Materialized {} to {}: {} removals, {} files, {} symlinks, "
             + "{} mode changes, {} bytes",

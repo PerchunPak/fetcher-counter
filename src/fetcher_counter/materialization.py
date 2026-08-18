@@ -262,21 +262,40 @@ def _remove_empty_parents(root: bytes, relative: bytes) -> None:
         parent = os.path.dirname(parent)
 
 
+def _deepest_first(paths: list[bytes]) -> list[bytes]:
+    return sorted(
+        paths,
+        key=lambda path: (path.count(b"/"), len(path)),
+        reverse=True,
+    )
+
+
 def apply_removals(worktree: Path, deltas: list[TreeDelta]) -> int:
     """Remove every old side, deepest paths first.
 
     Removals must all precede writes so a path that changes type, or a
     directory that becomes a file, never collides with its own replacement.
+    Emptied parents are pruned only after the writes, by
+    `prune_empty_parents()`, because a write may repopulate them.
     """
     root = os.fsencode(worktree)
-    removals = sorted(
-        (delta.path for delta in deltas if delta.old_mode != b"000000"),
-        key=lambda path: (path.count(b"/"), len(path)),
-        reverse=True,
+    removals = _deepest_first(
+        [delta.path for delta in deltas if delta.old_mode != b"000000"]
     )
     for relative in removals:
         _remove_path(_absolute(root, relative))
     return len(removals)
+
+
+def discard_paths(worktree: Path, paths: list[bytes]) -> int:
+    """Remove `paths` and any directories they leave empty."""
+    root = os.fsencode(worktree)
+    ordered = _deepest_first(paths)
+    for relative in ordered:
+        _remove_path(_absolute(root, relative))
+    for relative in ordered:
+        _remove_empty_parents(root, relative)
+    return len(ordered)
 
 
 def apply_writes(
@@ -452,10 +471,88 @@ class MaterializedWorktree:
         """
         await asyncio.to_thread(self._write_state, dirty=dirty)
 
+    async def _tree_delta(self, base: str, target: str) -> list[TreeDelta]:
+        output = await run_git(
+            self.repository,
+            "diff-tree",
+            "--raw",
+            "-z",
+            "--no-renames",
+            "-r",
+            base,
+            target,
+        )
+        return parse_raw_tree_delta(output)
+
+    async def _discard_materialized_paths(
+        self,
+        base: str,
+        logical: str,
+        target: str,
+    ) -> None:
+        """Remove worktree paths a native checkout to `target` cannot reach.
+
+        After a successful materialization the worktree matches the logical
+        commit exactly and only the index is stale, so `checkout --force`
+        already reconciles every path the index knows about, and it also
+        writes any path the target contains. That leaves exactly one
+        unreachable set: paths present in the logical commit but in neither
+        the index -- still at native `base` -- nor `target`. Git holds no
+        entry for those at all, so it never considers them.
+
+        Removing precisely that set replaces a full-tree `git clean -ffdx`,
+        which costs about 0.6s on a Nixpkgs worktree with 50k files. Keeping
+        the set minimal matters as much as avoiding the walk: discarding a
+        path the target also holds is safe but makes the checkout write it
+        back, which measured 1.56s against 0.35s for the minimal set.
+        """
+        if logical in {base, target}:
+            return
+        unindexed = {
+            delta.path
+            for delta in await self._tree_delta(base, logical)
+            if delta.old_mode == b"000000"
+        }
+        if not unindexed:
+            return
+        absent_from_target = {
+            delta.path
+            for delta in await self._tree_delta(logical, target)
+            if delta.new_mode == b"000000"
+        }
+        stale = sorted(unindexed & absent_from_target)
+        if stale:
+            discarded = await asyncio.to_thread(discard_paths, self.path, stale)
+            logger.debug(
+                "Discarded {} materialized paths from {} before native checkout",
+                discarded,
+                self.path,
+            )
+
     async def native_checkout(self, commit: str) -> None:
+        # Decide before marking the worker dirty, because the decision depends
+        # on the logical state the marker is about to invalidate.
+        base = self.native_commit
+        logical = self.current_commit
+        targeted = (
+            not self.recovery_required and base is not None and logical is not None
+        )
         self.recovery_required = True
         await self._store_state(dirty=True)
-        if self.state_path is not None:
+        if targeted:
+            assert base is not None
+            assert logical is not None
+            try:
+                await self._discard_materialized_paths(base, logical, commit)
+            except Exception as error:  # noqa: BLE001
+                logger.warning(
+                    "Could not discard materialized paths in {}; "
+                    + "falling back to git clean: {}",
+                    self.path,
+                    error,
+                )
+                targeted = False
+        if not targeted and self.state_path is not None:
             _ = await run_git(self.path, "clean", "-ffdx")
         await self.checkout_function(self.path, commit)
         head = (await run_git(self.path, "rev-parse", "HEAD")).decode().strip()
@@ -463,15 +560,21 @@ class MaterializedWorktree:
             raise MaterializationError(
                 f"native checkout selected {head} instead of {commit}"
             )
-        status = await run_git(
-            self.path,
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-            "--ignored=matching",
-        )
-        if status:
-            raise MaterializationError("native checkout left the worktree dirty")
+        if not targeted:
+            # Recovery starts from untrusted worktree contents, so the full
+            # walk is worth its cost here. It is skipped on the hot path,
+            # where the discarded-path set is exact and covered by tests.
+            status = await run_git(
+                self.path,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+            )
+            if status:
+                raise MaterializationError(
+                    "native checkout left the worktree dirty"
+                )
         self.current_commit = commit
         self.native_commit = commit
         self.recovery_required = False
@@ -485,17 +588,7 @@ class MaterializedWorktree:
         base = self.current_commit
         await self._store_state(dirty=True)
         try:
-            output = await run_git(
-                self.repository,
-                "diff-tree",
-                "--raw",
-                "-z",
-                "--no-renames",
-                "-r",
-                base,
-                commit,
-            )
-            deltas = parse_raw_tree_delta(output)
+            deltas = await self._tree_delta(base, commit)
             blobs = await read_target_blobs(self.repository, deltas)
             (
                 removed,

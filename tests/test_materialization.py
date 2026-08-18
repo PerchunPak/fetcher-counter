@@ -10,10 +10,10 @@ from pathlib import Path
 
 import pytest
 
-from fetcher_counter import cli
+from fetcher_counter import cli, materialization
 from fetcher_counter.cli import Config, run
 from fetcher_counter.discovery import FetcherDiscoveryError
-from fetcher_counter.history import SampledCommit
+from fetcher_counter.history import SampledCommit, run_git as git_command
 from fetcher_counter.materialization import (
     MaterializationError,
     MaterializedWorktree,
@@ -212,6 +212,130 @@ async def test_materialization_matches_native_checkout_across_transitions(
         await materialized.materialize(commit)
         _ = run_git(control, "checkout", "--detach", "--force", commit)
         assert snapshot(worker) == snapshot(control), commit
+
+
+def residue_trees() -> list[dict[bytes, tuple[str, bytes]]]:
+    """Trees whose later commits add paths absent from the first commit.
+
+    Those paths have no index entry once the worker's index is left at the
+    first commit, so `checkout --force` alone cannot remove them.
+    """
+    return [
+        {b"base": ("file", b"base")},
+        {
+            b"base": ("file", b"base"),
+            b"added/deep/leaf": ("file", b"leaf"),
+            b"link": ("symlink", b"base"),
+        },
+        {
+            b"base": ("file", b"base"),
+            b"added/deep/leaf": ("file", b"changed"),
+            b"only-here": ("file", b"solo"),
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_checkout_after_materialization_leaves_no_residue(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    commits = [write_tree(repository, tree) for tree in residue_trees()]
+    worker = tmp_path / "worker"
+    control = tmp_path / "control"
+    _ = run_git(repository, "worktree", "add", "--detach", str(worker), commits[0])
+    _ = run_git(
+        repository, "worktree", "add", "--detach", str(control), commits[0]
+    )
+    materialized = MaterializedWorktree(repository, worker)
+    await materialized.native_checkout(commits[0])
+    for commit in commits[1:]:
+        await materialized.materialize(commit)
+
+    # Back to the native base, which contains none of the added paths.
+    await materialized.native_checkout(commits[0])
+
+    _ = run_git(control, "checkout", "--detach", "--force", commits[0])
+    assert snapshot(worker) == snapshot(control)
+    assert not (worker / "added").exists()
+    assert (
+        run_git(
+            worker,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+        )
+        == ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_checkout_overwrites_unindexed_paths_kept_by_target(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    """Paths absent from the index but present in the target are not discarded.
+
+    `checkout --force` writes them itself, so the minimal discard set leaves
+    them alone; this pins that Git really does overwrite them.
+    """
+    base = write_tree(repository, {b"base": ("file", b"base")})
+    middle = write_tree(
+        repository,
+        {b"base": ("file", b"base"), b"added/x": ("file", b"from middle")},
+    )
+    target = write_tree(
+        repository,
+        {
+            b"base": ("file", b"base"),
+            b"added/x": ("executable", b"from target"),
+        },
+    )
+    worker = tmp_path / "worker"
+    control = tmp_path / "control"
+    _ = run_git(repository, "worktree", "add", "--detach", str(worker), base)
+    _ = run_git(repository, "worktree", "add", "--detach", str(control), base)
+    materialized = MaterializedWorktree(repository, worker)
+    await materialized.native_checkout(base)
+    await materialized.materialize(middle)
+
+    await materialized.native_checkout(target)
+
+    _ = run_git(control, "checkout", "--detach", "--force", target)
+    assert snapshot(worker) == snapshot(control)
+    assert (worker / "added" / "x").read_bytes() == b"from target"
+
+
+@pytest.mark.asyncio
+async def test_hot_path_native_checkout_avoids_full_tree_walk(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commits = [write_tree(repository, tree) for tree in residue_trees()]
+    worker = tmp_path / "worker"
+    state_path = tmp_path / "state.json"
+    _ = run_git(repository, "worktree", "add", "--detach", str(worker), commits[0])
+    materialized = MaterializedWorktree(repository, worker, state_path)
+    await materialized.native_checkout(commits[0])
+    for commit in commits[1:]:
+        await materialized.materialize(commit)
+
+    commands: list[tuple[str, ...]] = []
+    real = git_command
+
+    async def recording(
+        repo: Path, *arguments: str, input: bytes | None = None
+    ) -> bytes:
+        commands.append(arguments)
+        return await real(repo, *arguments, input=input)
+
+    monkeypatch.setattr(materialization, "run_git", recording)
+    await materialized.native_checkout(commits[0])
+
+    assert not [command for command in commands if command[0] == "clean"]
+    assert not [command for command in commands if command[0] == "status"]
 
 
 @pytest.mark.asyncio

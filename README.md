@@ -23,8 +23,8 @@ uv run fetcher-counter
 ```
 
 The default database is `./data/fetchers.sqlite3`. Paths, the commit sampling
-interval, the native-checkout interval, and the full-scan interval can be
-overridden:
+interval, the native-checkout interval, the full-scan interval, and the
+incremental materialization limits can be overridden:
 
 ```console
 uv run fetcher-counter \
@@ -33,6 +33,8 @@ uv run fetcher-counter \
   --interval 50 \
   --native-checkout-interval 25 \
   --full-scan-interval 25 \
+  --max-incremental-paths 2000 \
+  --max-incremental-bytes 33554432 \
   --workers 4 \
   --reverse \
   --no-first-parent \
@@ -150,6 +152,21 @@ schedule with `--native-checkout-interval`. This does not force a full count.
 Likewise, `--full-scan-interval` does not force native checkout. When both
 schedules coincide, the program performs one native checkout followed by one
 full count.
+
+Incremental materialization only pays off while a transition is small, so
+`--max-incremental-paths` (default 2000) and `--max-incremental-bytes` (default
+32 MiB) bound it. A transition above either limit is handed to native checkout
+instead. This is a deliberate choice rather than a fallback failure, and it is
+reported at `DEBUG` level as a chosen native checkout, separately from the
+warning a genuine materialization failure emits.
+
+The path limit reflects a measured crossover on a Nixpkgs worktree with 50k
+files: materialization took 0.43s against 0.79s for a native checkout at 471
+changed paths, but 3.40s against 2.57s at 8360 paths. `--no-first-parent`
+sampling reaches past that regularly, because consecutive samples straddle
+merge boundaries. The byte limit bounds peak memory for the same transitions;
+blob contents within a limit are still fetched in size-bounded batches rather
+than all at once.
 
 The first revision without a valid adjacent result uses one ripgrep process to
 scan all Nix files for every active fetcher as fixed-string, whole-word patterns.

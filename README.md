@@ -85,11 +85,18 @@ rather than the file marks ownership.
 Worker worktrees are reused across runs when Git reports them as registered,
 unlocked, and not prunable. They must either be entirely pristine or have a
 recognized project-owned materialization marker. The marker records the logical
-filesystem commit independently from Git `HEAD` and the index, and marks an
-update dirty before any files change. A clean marker allows incremental reuse;
-a dirty or malformed managed marker forces native checkout recovery. Arbitrary
-dirty worktrees without a matching marker, including untracked and ignored
-files, are still refused and left untouched.
+filesystem commit independently from Git `HEAD` and the index, and is marked
+dirty before any files change.
+
+The marker is only written when it changes state, not once per sample, because
+each write is fsynced and on Btrfs an fsync commits a filesystem-wide
+transaction. It therefore reads clean exactly at native checkout boundaries: a
+worker that leaves its base stays marked dirty until the next native checkout,
+including the closing one at the end of each shard. A clean marker allows
+incremental reuse; a dirty or malformed managed marker forces native checkout
+recovery, which is also what an interrupted run leaves behind. Arbitrary dirty
+worktrees without a matching marker, including untracked and ignored files, are
+still refused and left untouched.
 
 Normal samples update the materialized filesystem directly from Git tree and
 blob objects without rewriting the index. Regular files, executable modes, and

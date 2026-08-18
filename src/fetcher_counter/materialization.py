@@ -498,6 +498,7 @@ class MaterializedWorktree:
     current_commit: str | None = None
     native_commit: str | None = None
     recovery_required: bool = False
+    marker_dirty: bool = False
 
     def __post_init__(self) -> None:
         if self.state_path is None:
@@ -505,15 +506,18 @@ class MaterializedWorktree:
         state = read_state(self.state_path, self.repository, self.path)
         if state is None:
             self.recovery_required = self.state_path.exists()
+            self.marker_dirty = self.recovery_required
             return
         self.current_commit = state.current_commit
         self.native_commit = state.native_commit
         self.recovery_required = state.dirty
+        self.marker_dirty = state.dirty
         if state.dirty:
             self.current_commit = None
             self.native_commit = None
 
     def _write_state(self, *, dirty: bool) -> None:
+        self.marker_dirty = dirty
         if self.state_path is None:
             return
         state = MaterializationState(
@@ -550,6 +554,20 @@ class MaterializedWorktree:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary)
             raise
+
+    async def _mark_dirty(self) -> None:
+        """Flag the worker as mid-update, at most once per clean interval.
+
+        Only the clean-to-dirty transition has to reach disk. A dirty marker is
+        never trusted, so the commits it records carry no meaning and rewriting
+        it per sample fsyncs for nothing: on Btrfs each fsync is a
+        filesystem-wide transaction commit, measured at 15ms median under load,
+        and all shards share this one process. A crash therefore costs one
+        recovery checkout, which is what a dirty marker already means.
+        """
+        if self.marker_dirty:
+            return
+        await self._store_state(dirty=True)
 
     async def _store_state(self, *, dirty: bool) -> None:
         """Persist the marker without stalling the shared event loop.
@@ -627,7 +645,7 @@ class MaterializedWorktree:
             not self.recovery_required and base is not None and logical is not None
         )
         self.recovery_required = True
-        await self._store_state(dirty=True)
+        await self._mark_dirty()
         if targeted:
             assert base is not None
             assert logical is not None
@@ -738,7 +756,7 @@ class MaterializedWorktree:
             )
         batches = plan_object_batches(objects, sizes, MATERIALIZATION_BATCH_BYTES)
 
-        await self._store_state(dirty=True)
+        await self._mark_dirty()
         try:
             removed = await asyncio.to_thread(apply_removals, self.path, deltas)
             writes, symlinks, modes, bytes_written = await self._apply_batches(
@@ -750,7 +768,6 @@ class MaterializedWorktree:
             raise
         self.current_commit = commit
         self.recovery_required = False
-        await self._store_state(dirty=False)
         logger.debug(
             "Materialized {} to {}: {} removals, {} files, {} symlinks, "
             + "{} mode changes, {} bytes in {} batches",
@@ -766,6 +783,8 @@ class MaterializedWorktree:
 
     async def restore_pristine(self) -> None:
         if self.current_commit is not None and (
-            self.recovery_required or self.current_commit != self.native_commit
+            self.recovery_required
+            or self.marker_dirty
+            or self.current_commit != self.native_commit
         ):
             await self.native_checkout(self.current_commit)

@@ -482,11 +482,60 @@ async def test_clean_marker_restores_logical_and_native_commits(
     await original.native_checkout(first)
     await original.materialize(second)
 
+    # Mid-shard the marker stays dirty, so an interrupted run recovers rather
+    # than trusting a base the marker cannot vouch for.
+    interrupted = MaterializedWorktree(repository, worker, state_path)
+    assert interrupted.recovery_required is True
+    assert interrupted.current_commit is None
+
+    await original.restore_pristine()
     restored = MaterializedWorktree(repository, worker, state_path)
 
     assert restored.current_commit == second
-    assert restored.native_commit == first
+    assert restored.native_commit == second
     assert restored.recovery_required is False
+
+
+@pytest.mark.asyncio
+async def test_marker_is_written_once_per_clean_interval(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only clean-to-dirty and dirty-to-clean transitions reach disk.
+
+    Each write fsyncs, which on Btrfs commits a filesystem-wide transaction,
+    so a per-sample marker would fsync once for every sample of every shard.
+    """
+    commits = [
+        write_tree(repository, {b"value": ("file", str(index).encode())})
+        for index in range(5)
+    ]
+    worker = tmp_path / "worker"
+    state_path = tmp_path / "state.json"
+    _ = run_git(repository, "worktree", "add", "--detach", str(worker), commits[0])
+    materialized = MaterializedWorktree(repository, worker, state_path)
+    await materialized.native_checkout(commits[0])
+
+    writes: list[bool] = []
+    real = MaterializedWorktree._write_state
+
+    def recording(instance: MaterializedWorktree, *, dirty: bool) -> None:
+        writes.append(dirty)
+        real(instance, dirty=dirty)
+
+    monkeypatch.setattr(MaterializedWorktree, "_write_state", recording)
+    for commit in commits[1:]:
+        await materialized.materialize(commit)
+
+    # One write for four materializations, not one per sample.
+    assert writes == [True]
+
+    await materialized.restore_pristine()
+
+    # The closing native checkout reuses the dirty marker already on disk and
+    # only writes again to record the clean state.
+    assert writes == [True, False]
 
 
 @pytest.mark.asyncio

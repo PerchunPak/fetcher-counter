@@ -431,13 +431,28 @@ async def test_optimized_and_native_runs_store_identical_databases(
 
     def contents(
         database: Path,
-    ) -> tuple[list[tuple[object, ...]], list[tuple[object, ...]]]:
+    ) -> tuple[dict[str, tuple[object, ...]], list[dict[str, object]]]:
+        """Read the table keyed by column name rather than by column order.
+
+        Fetcher columns are added when a shard first discovers the fetcher, so
+        their physical order depends on how the shards interleave and is not a
+        property of the recorded data. Only the named contents are compared.
+        """
         connection = sqlite3.connect(database)
         try:
-            schema = connection.execute('PRAGMA table_info("fetchers")').fetchall()
-            rows = connection.execute(
-                'SELECT * FROM "fetchers" ORDER BY "commit"'
-            ).fetchall()
+            schema = {
+                str(column[1]): tuple(column[2:])
+                for column in connection.execute(
+                    'PRAGMA table_info("fetchers")'
+                ).fetchall()
+            }
+            connection.row_factory = sqlite3.Row
+            rows = [
+                dict(row)
+                for row in connection.execute(
+                    'SELECT * FROM "fetchers" ORDER BY "commit"'
+                ).fetchall()
+            ]
         finally:
             connection.close()
         return schema, rows

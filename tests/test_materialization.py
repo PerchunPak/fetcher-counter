@@ -20,7 +20,9 @@ from fetcher_counter.materialization import (
     NativeCheckoutRequiredError,
     TreeDelta,
     parse_batch_blobs,
+    parse_batch_sizes,
     parse_raw_tree_delta,
+    plan_object_batches,
 )
 from tests.conftest import GIT, run_git
 
@@ -212,6 +214,116 @@ async def test_materialization_matches_native_checkout_across_transitions(
         await materialized.materialize(commit)
         _ = run_git(control, "checkout", "--detach", "--force", commit)
         assert snapshot(worker) == snapshot(control), commit
+
+
+def test_batch_size_parser_reads_declared_sizes() -> None:
+    objects = [b"a" * 40, b"b" * 40]
+    output = b"a" * 40 + b" blob 0\n" + b"b" * 40 + b" blob 17\n"
+
+    assert parse_batch_sizes(output, objects) == {b"a" * 40: 0, b"b" * 40: 17}
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"a" * 40 + b" missing\n",
+        b"a" * 40 + b" tree 3\n",
+        b"a" * 40 + b" blob nope\n",
+        b"b" * 40 + b" blob 3\n",
+        b"a" * 40 + b" blob 3\n" + b"b" * 40 + b" blob 3\n",
+        b"",
+    ],
+)
+def test_batch_size_parser_rejects_bad_output(output: bytes) -> None:
+    with pytest.raises(MaterializationError):
+        _ = parse_batch_sizes(output, [b"a" * 40])
+
+
+def test_object_batches_respect_the_byte_budget() -> None:
+    objects = [b"a", b"b", b"c", b"d"]
+    sizes = {b"a": 6, b"b": 5, b"c": 20, b"d": 1}
+
+    # `c` alone exceeds the budget, so it still gets a batch of its own.
+    assert plan_object_batches(objects, sizes, 10) == [
+        [b"a"],
+        [b"b"],
+        [b"c"],
+        [b"d"],
+    ]
+    assert plan_object_batches(objects, sizes, 100) == [objects]
+    assert plan_object_batches([], {}, 10) == []
+
+
+@pytest.mark.asyncio
+async def test_materialization_batches_match_a_single_batch(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    # Distinct contents, so the blobs cannot dedupe into a single object and
+    # every batch boundary is real.
+    first = {f"file-{index}".encode(): ("file", b"one") for index in range(12)}
+    second = {
+        f"file-{index}".encode(): ("file", f"two-{index}".encode() * 400)
+        for index in range(12)
+    }
+    commits = [write_tree(repository, tree) for tree in (first, second)]
+    worker = tmp_path / "worker"
+    control = tmp_path / "control"
+    _ = run_git(repository, "worktree", "add", "--detach", str(worker), commits[0])
+    _ = run_git(
+        repository, "worktree", "add", "--detach", str(control), commits[0]
+    )
+    materialized = MaterializedWorktree(repository, worker)
+    await materialized.native_checkout(commits[0])
+
+    # One blob per batch, so every batch boundary is exercised.
+    monkeypatched = MaterializedWorktree(repository, control)
+    await monkeypatched.native_checkout(commits[0])
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(materialization, "MATERIALIZATION_BATCH_BYTES", 1)
+        await materialized.materialize(commits[1])
+    await monkeypatched.materialize(commits[1])
+
+    assert snapshot(worker) == snapshot(control)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limits", "reason"),
+    [
+        ({"max_paths": 1}, "changed paths exceed"),
+        ({"max_bytes": 1}, "delta bytes exceed"),
+    ],
+)
+async def test_oversized_transitions_require_native_checkout(
+    repository: Path,
+    tmp_path: Path,
+    limits: dict[str, int],
+    reason: str,
+) -> None:
+    """A refused delta must leave the trusted base and the worktree untouched.
+
+    Otherwise the caller's native checkout would take the expensive recovery
+    path instead of the targeted one.
+    """
+    first = write_tree(
+        repository, {b"a": ("file", b"one"), b"b": ("file", b"one")}
+    )
+    second = write_tree(
+        repository, {b"a": ("file", b"two"), b"b": ("file", b"two")}
+    )
+    worker = tmp_path / "worker"
+    _ = run_git(repository, "worktree", "add", "--detach", str(worker), first)
+    materialized = MaterializedWorktree(repository, worker)
+    await materialized.native_checkout(first)
+    before = snapshot(worker)
+
+    with pytest.raises(NativeCheckoutRequiredError, match=reason):
+        await materialized.materialize(second, **limits)
+
+    assert snapshot(worker) == before
+    assert materialized.current_commit == first
+    assert materialized.recovery_required is False
 
 
 def residue_trees() -> list[dict[bytes, tuple[str, bytes]]]:

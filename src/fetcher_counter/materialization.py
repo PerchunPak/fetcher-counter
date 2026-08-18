@@ -25,6 +25,11 @@ SYMLINK_MODE = b"120000"
 GITLINK_MODE = b"160000"
 SUPPORTED_MODES = REGULAR_MODES | {SYMLINK_MODE}
 ZERO_MODES = {b"000000"}
+# Blob contents are held in memory while they are written, and every shard
+# shares one process, so they are fetched in size-bounded batches rather than
+# in one unbounded `cat-file` call. An 84 MB transition previously peaked at
+# 365 MB resident, evicting the page cache that discovery and counting rely on.
+MATERIALIZATION_BATCH_BYTES = 8 * 1024 * 1024
 
 
 class MaterializationError(RuntimeError):
@@ -162,17 +167,90 @@ def parse_batch_blobs(output: bytes, objects: list[bytes]) -> dict[bytes, bytes]
     return blobs
 
 
-async def read_target_blobs(
-    repository: Path,
-    deltas: list[TreeDelta],
-) -> dict[bytes, bytes]:
-    objects = list(
+def parse_batch_sizes(output: bytes, objects: list[bytes]) -> dict[bytes, int]:
+    """Parse `git cat-file --batch-check` output into declared blob sizes."""
+    lines = output.split(b"\n")
+    if lines and lines[-1] == b"":
+        _ = lines.pop()
+    if len(lines) != len(objects):
+        raise MaterializationError(
+            "git cat-file returned the wrong number of object records"
+        )
+    sizes: dict[bytes, int] = {}
+    for line, expected in zip(lines, objects, strict=True):
+        if line == expected + b" missing":
+            raise MaterializationError(
+                f"git cat-file could not find object {expected.decode()}"
+            )
+        fields = line.split(b" ")
+        if len(fields) != 3:
+            raise MaterializationError("git cat-file returned a malformed record")
+        object_id, kind, size_raw = fields
+        if object_id != expected or kind != b"blob" or not size_raw.isdigit():
+            raise MaterializationError(
+                "git cat-file returned an unexpected object record"
+            )
+        sizes[object_id] = int(size_raw)
+    return sizes
+
+
+def target_objects(deltas: list[TreeDelta]) -> list[bytes]:
+    """List the distinct blobs a transition needs, in first-use order."""
+    return list(
         dict.fromkeys(
             delta.new_object
             for delta in deltas
             if delta.new_mode in SUPPORTED_MODES
         )
     )
+
+
+async def read_object_sizes(
+    repository: Path,
+    objects: list[bytes],
+) -> dict[bytes, int]:
+    if not objects:
+        return {}
+    output = await run_git(
+        repository,
+        "cat-file",
+        "--batch-check",
+        input=b"\n".join(objects) + b"\n",
+    )
+    return await asyncio.to_thread(parse_batch_sizes, output, objects)
+
+
+def plan_object_batches(
+    objects: list[bytes],
+    sizes: dict[bytes, int],
+    budget: int,
+) -> list[list[bytes]]:
+    """Group `objects` into batches of at most `budget` bytes of content.
+
+    An object larger than the budget forms a batch of its own, because it
+    still has to be read whole.
+    """
+    batches: list[list[bytes]] = []
+    current: list[bytes] = []
+    current_bytes = 0
+    for object_id in objects:
+        size = sizes[object_id]
+        if current and current_bytes + size > budget:
+            batches.append(current)
+            current = []
+            current_bytes = 0
+        current.append(object_id)
+        current_bytes += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+async def read_target_blobs(
+    repository: Path,
+    deltas: list[TreeDelta],
+) -> dict[bytes, bytes]:
+    objects = target_objects(deltas)
     if not objects:
         return {}
     output = await run_git(
@@ -352,6 +430,17 @@ def apply_tree_delta(
     )
     prune_empty_parents(worktree, deltas)
     return removed, writes, symlinks, executable_changes, byte_count
+
+
+def _apply_batch(
+    worktree: Path,
+    deltas: list[TreeDelta],
+    output: bytes,
+    objects: list[bytes],
+) -> tuple[int, int, int, int]:
+    """Parse one `cat-file` batch and write its paths in a single thread hop."""
+    blobs = parse_batch_blobs(output, objects)
+    return apply_writes(worktree, deltas, blobs)
 
 
 def state_path_for_worker(pool_dir: Path, index: int) -> Path:
@@ -580,28 +669,82 @@ class MaterializedWorktree:
         self.recovery_required = False
         await self._store_state(dirty=False)
 
-    async def materialize(self, commit: str) -> None:
+    async def _apply_batches(
+        self,
+        deltas: list[TreeDelta],
+        batches: list[list[bytes]],
+    ) -> tuple[int, int, int, int]:
+        by_object: dict[bytes, list[TreeDelta]] = {}
+        for delta in deltas:
+            if delta.new_mode in SUPPORTED_MODES:
+                by_object.setdefault(delta.new_object, []).append(delta)
+        writes = 0
+        symlinks = 0
+        modes = 0
+        bytes_written = 0
+        for batch in batches:
+            output = await run_git(
+                self.repository,
+                "cat-file",
+                "--batch",
+                input=b"\n".join(batch) + b"\n",
+            )
+            batch_deltas = [
+                delta for object_id in batch for delta in by_object[object_id]
+            ]
+            written = await asyncio.to_thread(
+                _apply_batch,
+                self.path,
+                batch_deltas,
+                output,
+                batch,
+            )
+            writes += written[0]
+            symlinks += written[1]
+            modes += written[2]
+            bytes_written += written[3]
+        return writes, symlinks, modes, bytes_written
+
+    async def materialize(
+        self,
+        commit: str,
+        *,
+        max_paths: int | None = None,
+        max_bytes: int | None = None,
+    ) -> None:
         if self.current_commit is None or self.recovery_required:
             raise NativeCheckoutRequiredError("no trusted materialized base")
         if self.current_commit == commit:
             return
         base = self.current_commit
+
+        # Plan the whole transition before touching anything. Every read here
+        # is side effect free, so a delta that is rejected or unreadable leaves
+        # the worker clean and its trusted base intact, and the caller's native
+        # checkout stays on the cheap non-recovery path.
+        deltas = await self._tree_delta(base, commit)
+        if max_paths is not None and len(deltas) > max_paths:
+            raise NativeCheckoutRequiredError(
+                f"{len(deltas)} changed paths exceed the incremental"
+                + f" limit of {max_paths}"
+            )
+        objects = target_objects(deltas)
+        sizes = await read_object_sizes(self.repository, objects)
+        total_bytes = sum(sizes.values())
+        if max_bytes is not None and total_bytes > max_bytes:
+            raise NativeCheckoutRequiredError(
+                f"{total_bytes} delta bytes exceed the incremental"
+                + f" limit of {max_bytes}"
+            )
+        batches = plan_object_batches(objects, sizes, MATERIALIZATION_BATCH_BYTES)
+
         await self._store_state(dirty=True)
         try:
-            deltas = await self._tree_delta(base, commit)
-            blobs = await read_target_blobs(self.repository, deltas)
-            (
-                removed,
-                writes,
-                symlinks,
-                modes,
-                bytes_written,
-            ) = await asyncio.to_thread(
-                apply_tree_delta,
-                self.path,
-                deltas,
-                blobs,
+            removed = await asyncio.to_thread(apply_removals, self.path, deltas)
+            writes, symlinks, modes, bytes_written = await self._apply_batches(
+                deltas, batches
             )
+            await asyncio.to_thread(prune_empty_parents, self.path, deltas)
         except BaseException:
             self.recovery_required = True
             raise
@@ -610,7 +753,7 @@ class MaterializedWorktree:
         await self._store_state(dirty=False)
         logger.debug(
             "Materialized {} to {}: {} removals, {} files, {} symlinks, "
-            + "{} mode changes, {} bytes",
+            + "{} mode changes, {} bytes in {} batches",
             base,
             commit,
             removed,
@@ -618,6 +761,7 @@ class MaterializedWorktree:
             symlinks,
             modes,
             bytes_written,
+            len(batches),
         )
 
     async def restore_pristine(self) -> None:

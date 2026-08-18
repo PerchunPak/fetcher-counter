@@ -22,6 +22,7 @@ from fetcher_counter.history import (
     checkout as history_checkout,
     worktree_pool_lock,
 )
+from fetcher_counter.materialization import NativeCheckoutRequiredError
 
 
 @pytest.fixture(autouse=True)
@@ -50,7 +51,14 @@ def fake_materializer(monkeypatch: pytest.MonkeyPatch) -> None:
             self.current_commit = commit
             self.native_commit = commit
 
-        async def materialize(self, commit: str) -> None:
+        async def materialize(
+            self,
+            commit: str,
+            *,
+            max_paths: int | None = None,
+            max_bytes: int | None = None,
+        ) -> None:
+            _ = max_paths, max_bytes
             await self.checkout_function(self.path, commit)
             self.current_commit = commit
             self.native_commit = commit
@@ -111,6 +119,30 @@ def test_parse_args_rejects_nonpositive_native_checkout_interval() -> None:
         _ = parse_args(["--native-checkout-interval", "0"])
 
 
+def test_parse_args_accepts_incremental_limits() -> None:
+    config = parse_args(
+        ["--max-incremental-paths", "50", "--max-incremental-bytes", "1024"]
+    )
+
+    assert config.max_incremental_paths == 50
+    assert config.max_incremental_bytes == 1024
+
+
+@pytest.mark.parametrize(
+    "option", ["--max-incremental-paths", "--max-incremental-bytes"]
+)
+def test_parse_args_rejects_nonpositive_incremental_limits(option: str) -> None:
+    with pytest.raises(SystemExit):
+        _ = parse_args([option, "0"])
+
+
+def test_incremental_limits_do_not_change_the_cadences() -> None:
+    config = parse_args(["--max-incremental-paths", "1"])
+
+    assert config.native_checkout_interval == 25
+    assert config.full_scan_interval == 25
+
+
 def test_parse_args_accepts_case_insensitive_log_level() -> None:
     config = parse_args(["--log-level", "debug"])
 
@@ -143,6 +175,30 @@ async def test_run_rejects_nonpositive_native_checkout_interval(
                 database=tmp_path / "fetchers.sqlite3",
                 expression=tmp_path / "get-fetchers.nix",
                 native_checkout_interval=0,
+            )
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("max_incremental_paths", "maximum incremental paths must be positive"),
+        ("max_incremental_bytes", "maximum incremental bytes must be positive"),
+    ],
+)
+async def test_run_rejects_nonpositive_incremental_limits(
+    tmp_path: Path,
+    field: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        await run(
+            Config(
+                nixpkgs=tmp_path / "nixpkgs",
+                database=tmp_path / "fetchers.sqlite3",
+                expression=tmp_path / "get-fetchers.nix",
+                **{field: 0},  # pyright: ignore[reportArgumentType]
             )
         )
 
@@ -1047,9 +1103,13 @@ def install_recording_materializer(
     environment: Environment,
     *,
     fail_materialization: set[str] | None = None,
+    refuse_materialization: set[str] | None = None,
 ) -> None:
     failures: set[str] = (
         fail_materialization if fail_materialization is not None else set()
+    )
+    refusals: set[str] = (
+        refuse_materialization if refuse_materialization is not None else set()
     )
 
     class RecordingMaterializer:
@@ -1078,8 +1138,19 @@ def install_recording_materializer(
             self.native_commit = commit
             self.recovery_required = False
 
-        async def materialize(self, commit: str) -> None:
+        async def materialize(
+            self,
+            commit: str,
+            *,
+            max_paths: int | None = None,
+            max_bytes: int | None = None,
+        ) -> None:
+            _ = max_paths, max_bytes
             environment.materializations.append(commit)
+            if commit in refusals:
+                # A guard refusal happens before anything is written, so the
+                # trusted base survives and no recovery is needed.
+                raise NativeCheckoutRequiredError("delta too large")
             if commit in failures:
                 self.recovery_required = True
                 raise RuntimeError("materialization failed")
@@ -1481,6 +1552,34 @@ async def test_native_checkout_and_full_scan_cadences_are_independent(
     ]
     assert ("commit-1", "commit-2") in environment.updates
     assert ("commit-2", "commit-3") not in environment.updates
+
+
+@pytest.mark.asyncio
+async def test_refused_materialization_checks_out_without_forcing_full_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An oversized delta is a policy choice, not a fallback failure."""
+    environment = install_fakes(monkeypatch, samples_named("first", "second"))
+    install_recording_materializer(
+        monkeypatch,
+        environment,
+        refuse_materialization={"second"},
+    )
+
+    await run(
+        parallel_config(
+            tmp_path,
+            workers=1,
+            worktrees_dir=None,
+            native_checkout_interval=25,
+        )
+    )
+
+    assert environment.native_checkouts == ["first", "second"]
+    assert environment.materializations == ["second"]
+    assert environment.full_scans == ["first"]
+    assert environment.updates == [("first", "second")]
 
 
 @pytest.mark.asyncio

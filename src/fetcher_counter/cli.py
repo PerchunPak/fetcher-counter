@@ -39,12 +39,23 @@ from fetcher_counter.history import (
 )
 from fetcher_counter.materialization import (
     MaterializedWorktree,
+    NativeCheckoutRequiredError,
     state_path_for_worker,
 )
 
 DEFAULT_INTERVAL = 50
 DEFAULT_FULL_SCAN_INTERVAL = 25
 DEFAULT_NATIVE_CHECKOUT_INTERVAL = 25
+# Incremental materialization only beats a native checkout while the delta is
+# small. Measured on a Nixpkgs worktree with 50k files: at 471 changed paths it
+# took 0.43s against 0.79s for a native checkout, but at 8360 paths it took
+# 3.40s against 2.57s, and at 12772 paths 5.28s against 3.90s. The crossover
+# sits near 2000 paths. Sampling with `--no-first-parent` reaches well past it,
+# because consecutive samples straddle merge boundaries: over 400 real adjacent
+# pairs at interval 5 the median was 26 changed paths but the 99th percentile
+# was 8360. The byte limit bounds peak memory for the same transitions.
+DEFAULT_MAX_INCREMENTAL_PATHS = 2000
+DEFAULT_MAX_INCREMENTAL_BYTES = 32 * 1024 * 1024
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_WORKERS = 1
 LOG_LEVELS = ("TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL")
@@ -66,6 +77,8 @@ class Config:
     interval: int = DEFAULT_INTERVAL
     full_scan_interval: int = DEFAULT_FULL_SCAN_INTERVAL
     native_checkout_interval: int = DEFAULT_NATIVE_CHECKOUT_INTERVAL
+    max_incremental_paths: int = DEFAULT_MAX_INCREMENTAL_PATHS
+    max_incremental_bytes: int = DEFAULT_MAX_INCREMENTAL_BYTES
     log_level: str = DEFAULT_LOG_LEVEL
     workers: int = DEFAULT_WORKERS
     reverse: bool = False
@@ -166,6 +179,20 @@ def parse_args(arguments: list[str] | None = None) -> Config:
         help="sampled iterations between native checkouts (default: 25)",
     )
     _ = parser.add_argument(
+        "--max-incremental-paths",
+        type=_positive_int,
+        default=DEFAULT_MAX_INCREMENTAL_PATHS,
+        help="changed paths above which a native checkout is used"
+        + f" (default: {DEFAULT_MAX_INCREMENTAL_PATHS})",
+    )
+    _ = parser.add_argument(
+        "--max-incremental-bytes",
+        type=_positive_int,
+        default=DEFAULT_MAX_INCREMENTAL_BYTES,
+        help="delta bytes above which a native checkout is used"
+        + f" (default: {DEFAULT_MAX_INCREMENTAL_BYTES})",
+    )
+    _ = parser.add_argument(
         "--workers",
         type=_positive_int,
         default=DEFAULT_WORKERS,
@@ -203,6 +230,8 @@ def parse_args(arguments: list[str] | None = None) -> Config:
         interval=namespace.interval,
         full_scan_interval=namespace.full_scan_interval,
         native_checkout_interval=namespace.native_checkout_interval,
+        max_incremental_paths=namespace.max_incremental_paths,
+        max_incremental_bytes=namespace.max_incremental_bytes,
         log_level=namespace.log_level,
         workers=namespace.workers,
         reverse=namespace.reverse,
@@ -376,7 +405,23 @@ async def run_shard(
                 else:
                     try:
                         with timed("Materialization", sample.commit):
-                            await materialized.materialize(sample.commit)
+                            await materialized.materialize(
+                                sample.commit,
+                                max_paths=config.max_incremental_paths,
+                                max_bytes=config.max_incremental_bytes,
+                            )
+                    except NativeCheckoutRequiredError as error:
+                        # A deliberate policy choice, not a failure: the
+                        # transition is too large or uses a tree mode the
+                        # materializer does not reproduce.
+                        logger.debug(
+                            "Using native checkout from {} to {}: {}",
+                            materialized.current_commit,
+                            sample.commit,
+                            error,
+                        )
+                        with timed("Chosen native checkout", sample.commit):
+                            await materialized.native_checkout(sample.commit)
                     except Exception as error:  # noqa: BLE001
                         logger.warning(
                             "Incremental materialization from {} to {} failed; "
@@ -656,6 +701,10 @@ async def run(config: Config) -> None:
         raise ValueError("full scan interval must be positive")
     if config.native_checkout_interval < 1:
         raise ValueError("native checkout interval must be positive")
+    if config.max_incremental_paths < 1:
+        raise ValueError("maximum incremental paths must be positive")
+    if config.max_incremental_bytes < 1:
+        raise ValueError("maximum incremental bytes must be positive")
     if config.workers < 1:
         raise ValueError("workers must be positive")
     logger.debug("Starting fetcher counter with configuration {}", config)
